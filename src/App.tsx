@@ -1,0 +1,1545 @@
+import { Bot, Check, Home, Keyboard, Languages, Loader2, Mic, Pause, RotateCcw, Save, Server, Settings2, Sparkles, X } from "lucide-react";
+import { emitTo, listen } from "@tauri-apps/api/event";
+import { getCurrentWindow, Window } from "@tauri-apps/api/window";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  AssistantResult,
+  AppConfig,
+  WhisperModelProfile,
+  cancelNativeRecording,
+  checkFunasrService,
+  closeVoiceOverlay,
+  loadConfig,
+  outputTextToCursor,
+  polishText,
+  saveConfig,
+  startFunasrService,
+  startNativeRecording,
+  stopRecordingAndTranscribe,
+  translateText
+} from "./tauri";
+
+type Stage = "idle" | "recording" | "stopping" | "transcribing" | "recognized" | "polishing" | "done" | "error";
+type Section = "home" | "model" | "hotkey" | "ai";
+type VoiceOverlayState = {
+  stage: Stage;
+  status: string;
+  seconds: number;
+  text?: string;
+  level?: number;
+  transcribeSeconds?: number;
+  correctionSeconds?: number;
+  translationSeconds?: number;
+};
+type ShortcutAction = "start" | "stop" | "error";
+type ShortcutPayload = {
+  action?: ShortcutAction;
+  error?: string;
+};
+type TranscribedPayload = {
+  ok: boolean;
+  text?: string;
+  error?: string;
+  transcribeSeconds?: number;
+};
+
+const MAX_SECONDS = 60;
+const PROCESSING_STAGES: Stage[] = ["stopping", "transcribing", "recognized", "polishing"];
+const MAIN_LABEL = "main";
+const OVERLAY_LABEL = "voice-overlay";
+const OVERLAY_STATE_EVENT = "voice-overlay-state";
+const OVERLAY_CANCEL_EVENT = "voice-overlay-cancel";
+const RECORD_SHORTCUT_EVENT = "record-shortcut-pressed";
+const RECORD_TRANSCRIBED_EVENT = "record-transcribed";
+const DEFAULT_CONFIG: AppConfig = {
+  whisper_cli_path: "/usr/local/bin/whisper-cli",
+  whisper_model_path: "/Users/black/IdeaProjects/voice-transcriber-tauri/models/ggml-base.bin",
+  whisper_model_profiles: [
+    {
+      name: "Base 快速",
+      path: "/Users/black/IdeaProjects/voice-transcriber-tauri/models/ggml-base.bin",
+      speed_hint: "更快，适合日常短句输入"
+    },
+    {
+      name: "Large v3 Turbo 均衡",
+      path: "/Users/black/IdeaProjects/voice-transcriber-tauri/models/ggml-large-v3-turbo.bin",
+      speed_hint: "更准，速度中等"
+    },
+    {
+      name: "Large v3 高精度",
+      path: "/Users/black/IdeaProjects/voice-transcriber-tauri/models/ggml-large-v3.bin",
+      speed_hint: "更慢，适合准确率优先"
+    }
+  ],
+  whisper_threads: "8",
+  asr_engine: "funasr",
+  funasr_endpoint: "http://10.254.81.32:10095",
+  funasr_model: "iic/SenseVoiceSmall",
+  funasr_device: "cpu",
+  deepseek_api_key: "sk-5ccffb5099bb43cc9e98d85386b25cec",
+  deepseek_model: "deepseek-v4-flash",
+  deepseek_endpoint: "http://10.254.81.32:10095",
+  deepseek_key_configured: true,
+  translation_enabled: false,
+  target_language: "中文",
+  config_path: "",
+  record_shortcut: "CommandOrControl+1",
+  shortcut_enabled: true
+};
+const SHORTCUT_PRESETS = ["CommandOrControl+1", "CommandOrControl+Shift+Space", "CommandOrControl+Alt+Space", "CommandOrControl+Shift+R"];
+
+export function App() {
+  if (getSafeWindowLabel() === OVERLAY_LABEL) {
+    return <VoiceOverlayWindow />;
+  }
+  return <MainApp />;
+}
+
+function MainApp() {
+  const stageRef = useRef<Stage>("idle");
+  const timerRef = useRef<number>();
+  const processingTimerRef = useRef<number>();
+  const overlayHideTimerRef = useRef<number>();
+  const recordingStartedAtRef = useRef<number>();
+  const shortcutActionRef = useRef<(action?: ShortcutAction) => void>(() => undefined);
+  const configRef = useRef<AppConfig>(DEFAULT_CONFIG);
+  const targetLanguageRef = useRef("中文");
+  const lastHandledTranscriptionRef = useRef("");
+  const voiceInputCanceledRef = useRef(false);
+  const [stage, setStage] = useState<Stage>("idle");
+  const [seconds, setSeconds] = useState(0);
+  const [processingSeconds, setProcessingSeconds] = useState(0);
+  const [transcribeSeconds, setTranscribeSeconds] = useState<number>();
+  const [correctionSeconds, setCorrectionSeconds] = useState<number>();
+  const [translationSeconds, setTranslationSeconds] = useState<number>();
+  const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
+  const [activeSection, setActiveSection] = useState<Section>("home");
+  const [configMessage, setConfigMessage] = useState("");
+  const [funasrBusy, setFunasrBusy] = useState(false);
+  const [shortcutError, setShortcutError] = useState("");
+  const [isCapturingShortcut, setIsCapturingShortcut] = useState(false);
+  const [modelNameDraft, setModelNameDraft] = useState("");
+  const [modelPathDraft, setModelPathDraft] = useState("");
+  const [transcript, setTranscript] = useState("");
+  const [targetLanguage, setTargetLanguage] = useState("中文");
+  const [result, setResult] = useState<AssistantResult>();
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    loadConfig()
+      .then((nextConfig) => {
+        setConfig(nextConfig);
+        configRef.current = nextConfig;
+        setTargetLanguage(nextConfig.target_language || "中文");
+        targetLanguageRef.current = nextConfig.target_language || "中文";
+      })
+      .catch((err) => setError(toUserFacingError(err)));
+  }, []);
+
+  useEffect(() => {
+    configRef.current = config;
+  }, [config]);
+
+  useEffect(() => {
+    targetLanguageRef.current = targetLanguage;
+  }, [targetLanguage]);
+
+  useEffect(() => {
+    stageRef.current = stage;
+  }, [stage]);
+
+  function transitionStage(nextStage: Stage) {
+    stageRef.current = nextStage;
+    setStage(nextStage);
+  }
+
+  useEffect(() => {
+    shortcutActionRef.current = (action) => {
+      if (PROCESSING_STAGES.includes(stageRef.current)) {
+        return;
+      }
+      if (action === "error") {
+        return;
+      }
+      if (action === "stop") {
+        prepareHotkeyStop();
+        return;
+      }
+      if (stageRef.current === "recording") {
+        prepareHotkeyStop();
+        return;
+      }
+      beginRecordingUi();
+    };
+  });
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<ShortcutPayload>(RECORD_SHORTCUT_EVENT, (event) => {
+      if (event.payload?.action === "error") {
+        const message = event.payload.error || "全局快捷键启动录音失败，请回到主窗口重试。";
+        transitionStage("error");
+        setError(message);
+        void showOverlayState("error", "录音启动失败", 0, message);
+        scheduleOverlayHide();
+        return;
+      }
+      shortcutActionRef.current(event.payload?.action);
+    }).then((handler) => {
+      unlisten = handler;
+    });
+    return () => unlisten?.();
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen(OVERLAY_CANCEL_EVENT, () => {
+      cancelCurrentVoiceInput();
+    }).then((handler) => {
+      if (disposed) {
+        handler();
+        return;
+      }
+      unlisten = handler;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen<TranscribedPayload>(RECORD_TRANSCRIBED_EVENT, (event) => {
+      void handleTranscribedPayload(event.payload);
+    }).then((handler) => {
+      if (disposed) {
+        handler();
+        return;
+      }
+      unlisten = handler;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isCapturingShortcut) {
+      return;
+    }
+    const handler = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const shortcut = normalizeShortcut(event);
+      if (!shortcut) {
+        return;
+      }
+      void saveShortcut(shortcut);
+    };
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [isCapturingShortcut, config]);
+
+  const progress = useMemo(() => `${Math.min(100, (seconds / MAX_SECONDS) * 100)}%`, [seconds]);
+  const busy = PROCESSING_STAGES.includes(stage);
+
+  async function startRecording() {
+    if (stageRef.current === "recording" || PROCESSING_STAGES.includes(stageRef.current)) {
+      return;
+    }
+    setError("");
+    voiceInputCanceledRef.current = false;
+    try {
+      await startNativeRecording();
+      beginRecordingUi();
+    } catch (err) {
+      transitionStage("error");
+      const message = toUserFacingError(err);
+      setError(message);
+      void showOverlayState("error", "录音启动失败", 0, message);
+      scheduleOverlayHide();
+    }
+  }
+
+  function beginRecordingUi() {
+    if (stageRef.current === "recording" || PROCESSING_STAGES.includes(stageRef.current)) {
+      return;
+    }
+    clearTimer();
+    clearProcessingTimer();
+    stageRef.current = "recording";
+    setError("");
+    setResult(undefined);
+    setTranscript("");
+    lastHandledTranscriptionRef.current = "";
+    voiceInputCanceledRef.current = false;
+    setSeconds(0);
+    setProcessingSeconds(0);
+    setTranscribeSeconds(undefined);
+    setCorrectionSeconds(undefined);
+    setTranslationSeconds(undefined);
+    transitionStage("recording");
+    const startedAt = Date.now();
+    recordingStartedAtRef.current = startedAt;
+    void showOverlayState("recording", "正在监听语音", 0, "等待说话，按快捷键停止录音", 0.02);
+    timerRef.current = window.setInterval(() => {
+      const nextSeconds = Math.min(MAX_SECONDS, (Date.now() - startedAt) / 1000);
+      setSeconds(nextSeconds);
+      if (nextSeconds >= MAX_SECONDS) {
+        void stopRecordingFromUi();
+      }
+    }, 200);
+  }
+
+  function prepareHotkeyStop() {
+    if (stageRef.current !== "recording") {
+      return;
+    }
+    const finalSeconds = recordingStartedAtRef.current
+      ? Math.min(MAX_SECONDS, (Date.now() - recordingStartedAtRef.current) / 1000)
+      : seconds;
+    clearTimer();
+    recordingStartedAtRef.current = undefined;
+    setSeconds(finalSeconds);
+    startProcessingTimer();
+    transitionStage("transcribing");
+    void showOverlayState("transcribing", "本地识别中", 0, `${asrEngineName(configRef.current)} 正在处理录音`, 0.28);
+  }
+
+  async function stopRecordingFromUi() {
+    if (stageRef.current !== "recording") {
+      return;
+    }
+    clearTimer();
+    recordingStartedAtRef.current = undefined;
+    startProcessingTimer();
+    transitionStage("stopping");
+    void showOverlayState("stopping", "正在停止录音", seconds, "正在收束音频并准备识别", 0.18);
+    try {
+      await nextPaint();
+      transitionStage("transcribing");
+      void showOverlayState("transcribing", "本地识别中", 0, `${asrEngineName(configRef.current)} 正在处理录音`, 0.28);
+      const transcribeStartedAt = performance.now();
+      const text = await stopRecordingAndTranscribe();
+      const nextTranscribeSeconds = elapsedSeconds(transcribeStartedAt);
+      if (voiceInputCanceledRef.current) {
+        return;
+      }
+      await handleTranscribedText(text, nextTranscribeSeconds);
+    } catch (err) {
+      if (voiceInputCanceledRef.current) {
+        return;
+      }
+      transitionStage("error");
+      const message = toUserFacingError(err);
+      setError(message);
+      void showOverlayState("error", "处理失败", processingSeconds, message);
+      scheduleOverlayHide();
+    } finally {
+      clearProcessingTimer();
+    }
+  }
+
+  async function handleTranscribedPayload(payload: TranscribedPayload) {
+    clearTimer();
+    recordingStartedAtRef.current = undefined;
+    if (voiceInputCanceledRef.current) {
+      clearProcessingTimer();
+      return;
+    }
+    transitionStage(payload.ok ? "recognized" : "error");
+    if (!payload.ok) {
+      clearProcessingTimer();
+      const message = payload.error || "识别失败";
+      setError(message);
+      void showOverlayState("error", "处理失败", payload.transcribeSeconds ?? processingSeconds, message);
+      scheduleOverlayHide();
+      return;
+    }
+    const text = (payload.text || "").trim();
+    const dedupeKey = `${payload.transcribeSeconds ?? ""}:${text}`;
+    if (text && lastHandledTranscriptionRef.current === dedupeKey) {
+      return;
+    }
+    lastHandledTranscriptionRef.current = dedupeKey;
+    try {
+      await handleTranscribedText(text, payload.transcribeSeconds ?? processingSeconds);
+    } catch (err) {
+      transitionStage("error");
+      const message = toUserFacingError(err);
+      setError(message);
+      void showOverlayState("error", "处理失败", processingSeconds, message);
+      scheduleOverlayHide();
+    } finally {
+      clearProcessingTimer();
+    }
+  }
+
+  async function handleTranscribedText(text: string, nextTranscribeSeconds: number) {
+    if (voiceInputCanceledRef.current) {
+      return;
+    }
+    const currentConfig = configRef.current;
+    const currentTargetLanguage = targetLanguageRef.current;
+    setTranscribeSeconds(nextTranscribeSeconds);
+    setTranscript(text);
+    if (!currentConfig.deepseek_key_configured) {
+      setResult({
+        corrected_text: text,
+        translation: "",
+        notes: [`未配置 DeepSeek API Key，已输出 ${asrEngineName(currentConfig)} 转写文本。`],
+        confidence: "medium"
+      });
+      const outputOk = await outputFinalText(text);
+      transitionStage("done");
+      if (outputOk) {
+        void showOverlayState("done", "已输出到光标位置", nextTranscribeSeconds, previewOverlayText(text), 0.1, {
+          transcribeSeconds: nextTranscribeSeconds
+        });
+      }
+      scheduleOverlayHide();
+      return;
+    }
+    transitionStage("polishing");
+    void showOverlayState("polishing", "AI 正在纠错", 0, "正在修正错词、断句和标点", 0.45, {
+      transcribeSeconds: nextTranscribeSeconds
+    });
+    const correctionStartedAt = performance.now();
+    const correction = await polishText(text);
+    if (voiceInputCanceledRef.current) {
+      return;
+    }
+    const nextCorrectionSeconds = elapsedSeconds(correctionStartedAt);
+    setCorrectionSeconds(nextCorrectionSeconds);
+    setResult({
+      ...correction,
+      translation: ""
+    });
+
+    if (!currentConfig.translation_enabled) {
+      const outputOk = await outputFinalText(correction.corrected_text);
+      transitionStage("done");
+      if (outputOk) {
+        void showOverlayState("done", "已输出到光标位置", nextCorrectionSeconds, previewOverlayText(correction.corrected_text), 0.1, {
+          transcribeSeconds: nextTranscribeSeconds,
+          correctionSeconds: nextCorrectionSeconds
+        });
+      }
+      scheduleOverlayHide();
+      return;
+    }
+
+    void showOverlayState("polishing", "实时翻译中", 0, `正在翻译为${currentTargetLanguage}`, 0.5, {
+      transcribeSeconds: nextTranscribeSeconds,
+      correctionSeconds: nextCorrectionSeconds
+    });
+    const translationStartedAt = performance.now();
+    const translation = await translateText(correction.corrected_text, currentTargetLanguage);
+    if (voiceInputCanceledRef.current) {
+      return;
+    }
+    const nextTranslationSeconds = elapsedSeconds(translationStartedAt);
+    setTranslationSeconds(nextTranslationSeconds);
+    setResult({
+      ...correction,
+      translation
+    });
+    const outputOk = await outputFinalText(correction.corrected_text);
+    transitionStage("done");
+    if (outputOk) {
+      void showOverlayState("done", "已输出到光标位置", nextTranslationSeconds, previewOverlayText(correction.corrected_text), 0.1, {
+        transcribeSeconds: nextTranscribeSeconds,
+        correctionSeconds: nextCorrectionSeconds,
+        translationSeconds: nextTranslationSeconds
+      });
+    }
+    scheduleOverlayHide();
+  }
+
+  async function outputFinalText(text: string) {
+    if (voiceInputCanceledRef.current) {
+      return false;
+    }
+    const finalText = text.trim();
+    if (!finalText) {
+      return true;
+    }
+    try {
+      await outputTextToCursor(finalText);
+      return true;
+    } catch (err) {
+      const message = toUserFacingError(err);
+      setError(`${message}。文本已尽量写入剪贴板，可手动 Command+V 粘贴。`);
+      void showOverlayState("error", "自动粘贴失败", processingSeconds, "已尝试写入剪贴板，可手动 Command+V", 0.1, {
+        transcribeSeconds,
+        correctionSeconds,
+        translationSeconds
+      });
+      return false;
+    }
+  }
+
+  function reset() {
+    clearTimer();
+    clearProcessingTimer();
+    recordingStartedAtRef.current = undefined;
+    lastHandledTranscriptionRef.current = "";
+    voiceInputCanceledRef.current = false;
+    void cancelNativeRecording();
+    transitionStage("idle");
+    setSeconds(0);
+    setProcessingSeconds(0);
+    setTranscribeSeconds(undefined);
+    setCorrectionSeconds(undefined);
+    setTranslationSeconds(undefined);
+    setTranscript("");
+    setResult(undefined);
+    setError("");
+    hideOverlay();
+  }
+
+  function cancelCurrentVoiceInput() {
+    voiceInputCanceledRef.current = true;
+    lastHandledTranscriptionRef.current = "";
+    recordingStartedAtRef.current = undefined;
+    clearTimer();
+    clearProcessingTimer();
+    void cancelNativeRecording().catch(() => undefined);
+    transitionStage("idle");
+    setSeconds(0);
+    setProcessingSeconds(0);
+    setTranscribeSeconds(undefined);
+    setCorrectionSeconds(undefined);
+    setTranslationSeconds(undefined);
+    setTranscript("");
+    setResult(undefined);
+    setError("");
+    hideOverlay();
+  }
+
+  function clearTimer() {
+    if (timerRef.current) {
+      window.clearInterval(timerRef.current);
+      timerRef.current = undefined;
+    }
+  }
+
+  function startProcessingTimer() {
+    clearProcessingTimer();
+    const startedAt = Date.now();
+    setProcessingSeconds(0);
+    processingTimerRef.current = window.setInterval(() => {
+      const nextSeconds = (Date.now() - startedAt) / 1000;
+      setProcessingSeconds(nextSeconds);
+      const currentStage = stageRef.current;
+      if (PROCESSING_STAGES.includes(currentStage)) {
+        void showOverlayState(
+          currentStage,
+          overlayStatus(currentStage),
+          nextSeconds,
+          overlayText(currentStage),
+          currentStage === "polishing" ? 0.55 : 0.3,
+          {
+            transcribeSeconds,
+            correctionSeconds,
+            translationSeconds
+          }
+        );
+      }
+    }, 250);
+  }
+
+  function clearProcessingTimer() {
+    if (processingTimerRef.current) {
+      window.clearInterval(processingTimerRef.current);
+      processingTimerRef.current = undefined;
+    }
+  }
+
+  function updateConfig(patch: Partial<AppConfig>) {
+    setConfig((current) => ({ ...current, ...patch }));
+    setConfigMessage("");
+  }
+
+  async function persistConfig() {
+    setError("");
+    setConfigMessage("正在保存配置");
+    try {
+      const saved = await saveConfig(config);
+      setConfig(saved);
+      setTargetLanguage(saved.target_language || targetLanguage);
+      setConfigMessage("配置已保存");
+    } catch (err) {
+      setConfigMessage("");
+      setError(toUserFacingError(err));
+    }
+  }
+
+  async function saveShortcut(shortcut: string) {
+    setIsCapturingShortcut(false);
+    setShortcutError("");
+    setConfigMessage("正在保存快捷键");
+    const nextConfig = {
+      ...config,
+      record_shortcut: shortcut,
+      shortcut_enabled: true
+    };
+    setConfig(nextConfig);
+    try {
+      const saved = await saveConfig(nextConfig);
+      setConfig(saved);
+      setConfigMessage("快捷键已保存");
+    } catch (err) {
+      setShortcutError(toUserFacingError(err));
+      setConfigMessage("");
+    }
+  }
+
+  async function selectModel(modelPath: string) {
+    if (!modelPath) {
+      return;
+    }
+    const nextConfig = {
+      ...config,
+      whisper_model_path: modelPath
+    };
+    setConfig(nextConfig);
+    setConfigMessage("正在切换模型");
+    try {
+      const saved = await saveConfig(nextConfig);
+      setConfig(saved);
+      setConfigMessage("模型已切换");
+    } catch (err) {
+      setConfigMessage("");
+      setError(toUserFacingError(err));
+    }
+  }
+
+  async function addModelProfile() {
+    const modelPath = modelPathDraft.trim();
+    if (!modelPath) {
+      setConfigMessage("");
+      setError("请先填写模型文件路径。");
+      return;
+    }
+    const profile: WhisperModelProfile = {
+      name: modelNameDraft.trim() || modelNameFromPath(modelPath),
+      path: modelPath,
+      speed_hint: "自定义"
+    };
+    const nextProfiles = [
+      ...config.whisper_model_profiles.filter((item) => item.path.trim() !== modelPath),
+      profile
+    ];
+    const nextConfig = {
+      ...config,
+      whisper_model_path: modelPath,
+      whisper_model_profiles: nextProfiles
+    };
+    setConfig(nextConfig);
+    setModelNameDraft("");
+    setModelPathDraft("");
+    setConfigMessage("正在保存模型");
+    setError("");
+    try {
+      const saved = await saveConfig(nextConfig);
+      setConfig(saved);
+      setConfigMessage("模型已添加并切换");
+    } catch (err) {
+      setConfigMessage("");
+      setError(toUserFacingError(err));
+    }
+  }
+
+  async function removeModelProfile(modelPath: string) {
+    const nextProfiles = config.whisper_model_profiles.filter((item) => item.path !== modelPath);
+    const fallbackPath = nextProfiles[0]?.path || "";
+    const nextConfig = {
+      ...config,
+      whisper_model_path: config.whisper_model_path === modelPath ? fallbackPath : config.whisper_model_path,
+      whisper_model_profiles: nextProfiles
+    };
+    setConfig(nextConfig);
+    setConfigMessage("正在移除模型");
+    try {
+      const saved = await saveConfig(nextConfig);
+      setConfig(saved);
+      setConfigMessage("模型已移除");
+    } catch (err) {
+      setConfigMessage("");
+      setError(toUserFacingError(err));
+    }
+  }
+
+  async function startFunasr() {
+    setFunasrBusy(true);
+    setConfigMessage("正在保存配置并启动 FunASR 服务，首次启动会安装依赖并下载模型");
+    setError("");
+    try {
+      const saved = await saveConfig(config);
+      setConfig(saved);
+      const message = await startFunasrService();
+      setConfigMessage(message);
+    } catch (err) {
+      setConfigMessage("");
+      setError(toUserFacingError(err));
+    } finally {
+      setFunasrBusy(false);
+    }
+  }
+
+  async function checkFunasr() {
+    setFunasrBusy(true);
+    setConfigMessage("正在保存配置并检测 FunASR 服务");
+    setError("");
+    try {
+      const saved = await saveConfig(config);
+      setConfig(saved);
+      const health = await checkFunasrService();
+      setConfigMessage(`${health.message}：${health.model || saved.funasr_model} / ${health.device || saved.funasr_device}`);
+    } catch (err) {
+      setConfigMessage("");
+      setError(toUserFacingError(err));
+    } finally {
+      setFunasrBusy(false);
+    }
+  }
+
+  async function showOverlayState(
+    stage: Stage,
+    status: string,
+    seconds: number,
+    text?: string,
+    level = 0,
+    timing: Pick<VoiceOverlayState, "transcribeSeconds" | "correctionSeconds" | "translationSeconds"> = {}
+  ) {
+    const payload: VoiceOverlayState = {
+      stage,
+      status,
+      seconds,
+      text,
+      level,
+      ...timing
+    };
+    try {
+      if (voiceInputCanceledRef.current) {
+        return;
+      }
+      if (overlayHideTimerRef.current) {
+        window.clearTimeout(overlayHideTimerRef.current);
+        overlayHideTimerRef.current = undefined;
+      }
+      const overlay = await Window.getByLabel(OVERLAY_LABEL);
+      await overlay?.show();
+      await overlay?.setAlwaysOnTop(true);
+      await emitTo(OVERLAY_LABEL, OVERLAY_STATE_EVENT, payload);
+    } catch {
+      // 悬浮窗不可用时不影响主录音、识别和 AI 处理流程。
+    }
+  }
+
+  function scheduleOverlayHide() {
+    if (overlayHideTimerRef.current) {
+      window.clearTimeout(overlayHideTimerRef.current);
+    }
+    overlayHideTimerRef.current = window.setTimeout(hideOverlay, 1800);
+  }
+
+  function hideOverlay() {
+    if (overlayHideTimerRef.current) {
+      window.clearTimeout(overlayHideTimerRef.current);
+      overlayHideTimerRef.current = undefined;
+    }
+    void Window.getByLabel(OVERLAY_LABEL)
+      .then((overlay) => overlay?.hide())
+      .catch(() => undefined);
+  }
+
+  return (
+    <main className="app-shell">
+      <section className="hero-band">
+        <div>
+          <p className="eyebrow">语音输入 · AI 润色</p>
+          <h1>鱼泡语音助手</h1>
+        </div>
+        <div className="status-strip">
+          <StatusDot ok={Boolean(config?.whisper_model_path)} label="本地模型" />
+          <StatusDot ok={config.asr_engine === "funasr" || Boolean(config?.whisper_model_path)} label={asrEngineName(config)} />
+          <StatusDot ok={Boolean(config?.deepseek_key_configured)} label="DeepSeek" />
+        </div>
+      </section>
+
+      <nav className="page-tabs">
+        <TabButton active={activeSection === "home"} icon={<Home size={16} />} label="首页" onClick={() => setActiveSection("home")} />
+        <TabButton active={activeSection === "model"} icon={<Settings2 size={16} />} label="模型设置" onClick={() => setActiveSection("model")} />
+        <TabButton active={activeSection === "hotkey"} icon={<Keyboard size={16} />} label="快捷键" onClick={() => setActiveSection("hotkey")} />
+        <TabButton active={activeSection === "ai"} icon={<Bot size={16} />} label="AI 设置" onClick={() => setActiveSection("ai")} />
+      </nav>
+
+      {activeSection === "home" ? (
+        <section className="workbench">
+          <aside className="control-panel">
+            <div className="timer-ring" style={{ "--progress": progress } as React.CSSProperties}>
+              <div>
+                <span>{seconds.toFixed(1)}</span>
+                <small>/ {MAX_SECONDS}s</small>
+              </div>
+            </div>
+
+            <div className="record-actions">
+              {stage === "recording" ? (
+                <button className="primary danger" onClick={() => void stopRecordingFromUi()}>
+                  <Pause size={18} />
+                  结束输入
+                </button>
+              ) : (
+                <button className="primary" disabled={busy} onClick={() => void startRecording()}>
+                  <Mic size={18} />
+                  开始说话
+                </button>
+              )}
+              <button className="icon-button" disabled={busy} onClick={reset} title="重置">
+                <RotateCcw size={18} />
+              </button>
+            </div>
+
+            <label className="field">
+              <span>
+                <Languages size={16} />
+                翻译目标
+              </span>
+              <select
+                value={targetLanguage}
+                onChange={(event) => {
+                  setTargetLanguage(event.target.value);
+                  updateConfig({ target_language: event.target.value });
+                }}
+              >
+                <option value="中文">中文</option>
+                <option value="英文">英文</option>
+                <option value="日文">日文</option>
+                <option value="韩文">韩文</option>
+              </select>
+            </label>
+
+            <label className="switch-row panel-switch">
+              <input
+                type="checkbox"
+                checked={config.translation_enabled}
+                onChange={(event) => {
+                  const nextConfig = { ...config, translation_enabled: event.target.checked };
+                  setConfig(nextConfig);
+                  void saveConfig(nextConfig).then(setConfig).catch((err) => setError(toUserFacingError(err)));
+                }}
+              />
+              <span>{config.translation_enabled ? "实时翻译已启用" : "实时翻译已关闭"}</span>
+            </label>
+
+            <div className="config-box">
+              <div className="config-title">
+                <Settings2 size={16} />
+                当前配置
+              </div>
+              <dl>
+                <dt>模型文件</dt>
+                <dd>{config.asr_engine === "funasr" ? config.funasr_model : config?.whisper_model_path || "未配置"}</dd>
+                <dt>识别引擎</dt>
+                <dd>{asrEngineName(config)}</dd>
+                <dt>DeepSeek 模型</dt>
+                <dd>{config?.deepseek_model ?? "检测中"}</dd>
+                <dt>Whisper CLI</dt>
+                <dd>{config?.whisper_cli_path || "未配置"}</dd>
+              </dl>
+            </div>
+          </aside>
+
+          <section className="result-panel">
+            <Pipeline stage={stage} />
+
+            <ProcessingNotice stage={stage} seconds={processingSeconds} />
+            <TimingStats
+              transcribeSeconds={transcribeSeconds}
+              correctionSeconds={correctionSeconds}
+              translationSeconds={translationSeconds}
+            />
+
+            {error ? <div className="error-box">{error}</div> : null}
+
+            <div className="columns">
+              <TextBlock title="本地识别" icon={<Mic size={16} />} value={transcript || emptyTranscriptText(stage)} />
+              <TextBlock
+                title="纠错后文本"
+                icon={<Sparkles size={16} />}
+                value={result?.corrected_text || emptyCorrectedText(stage)}
+              />
+              <TextBlock
+                title="实时翻译"
+                icon={<Languages size={16} />}
+                value={!config.translation_enabled ? "实时翻译已关闭，只输出纠错后文本。" : result?.translation || emptyTranslationText(stage)}
+              />
+            </div>
+
+            {result?.notes.length ? (
+              <div className="notes">
+                <div className="notes-title">
+                  <Check size={16} />
+                  纠错依据
+                </div>
+                {result.notes.map((note) => (
+                  <p key={note}>{note}</p>
+                ))}
+              </div>
+            ) : null}
+          </section>
+        </section>
+      ) : null}
+
+      {activeSection === "model" ? (
+        <SettingsPanel title="模型设置" subtitle="配置语音识别引擎，不需要再手写 .env.local">
+          <SettingRow title="识别引擎" desc="Whisper 走本地 whisper.cpp；FunASR 走 HTTP 服务">
+            <select value={config.asr_engine} onChange={(event) => updateConfig({ asr_engine: event.target.value })}>
+              <option value="whisper">Whisper 本地模型</option>
+              <option value="funasr">FunASR / SenseVoice</option>
+            </select>
+          </SettingRow>
+
+          {config.asr_engine === "funasr" ? (
+            <>
+              <SettingRow title="FunASR 服务" desc="本机地址可启动服务；云端地址直接检测服务">
+                <div className="service-actions">
+                  <button className="primary" disabled={funasrBusy} onClick={() => void startFunasr()}>
+                    {funasrBusy ? <Loader2 size={16} className="spin" /> : <Server size={16} />}
+                    启动服务
+                  </button>
+                  <button className="icon-button wide" disabled={funasrBusy} onClick={() => void checkFunasr()}>
+                    检测服务
+                  </button>
+                </div>
+              </SettingRow>
+              <SettingRow title="服务地址" desc="默认本机 10095；也可填写云端 10095 地址">
+                <input value={config.funasr_endpoint} onChange={(event) => updateConfig({ funasr_endpoint: event.target.value })} />
+              </SettingRow>
+              <SettingRow title="FunASR 模型" desc="默认 SenseVoiceSmall；可换成已支持的 ModelScope 模型名或本地路径">
+                <input value={config.funasr_model} onChange={(event) => updateConfig({ funasr_model: event.target.value })} />
+              </SettingRow>
+              <SettingRow title="推理设备" desc="CPU 默认可用；有可用环境时可改为 cuda">
+                <select value={config.funasr_device} onChange={(event) => updateConfig({ funasr_device: event.target.value })}>
+                  <option value="cpu">cpu</option>
+                  <option value="cuda">cuda</option>
+                </select>
+              </SettingRow>
+            </>
+          ) : null}
+
+          <SettingRow title="当前 Whisper 模型" desc={activeModelProfile(config)?.speed_hint || "选择一个已保存模型，切换后立即保存"}>
+            <select value={config.whisper_model_path} onChange={(event) => void selectModel(event.target.value)}>
+              {config.whisper_model_profiles.map((profile) => (
+                <option key={profile.path} value={profile.path}>
+                  {profile.name}
+                </option>
+              ))}
+              {!config.whisper_model_profiles.length ? <option value="">未配置模型</option> : null}
+            </select>
+          </SettingRow>
+          <SettingRow title="模型档案" desc="Base 更快，Large 更准；可以保留多个模型随时切换">
+            <div className="model-profile-list">
+              {config.whisper_model_profiles.map((profile) => (
+                <button
+                  key={profile.path}
+                  className={profile.path === config.whisper_model_path ? "model-profile active" : "model-profile"}
+                  onClick={() => void selectModel(profile.path)}
+                >
+                  <strong>{profile.name}</strong>
+                  <span>{profile.speed_hint || "自定义"}</span>
+                  <small>{profile.path}</small>
+                </button>
+              ))}
+            </div>
+          </SettingRow>
+          <SettingRow title="新增模型" desc="填写 ggml 模型文件完整路径，保存后会加入档案并切换过去">
+            <div className="model-add-form">
+              <input value={modelNameDraft} onChange={(event) => setModelNameDraft(event.target.value)} placeholder="模型名称，例如 Tiny 快速" />
+              <input value={modelPathDraft} onChange={(event) => setModelPathDraft(event.target.value)} placeholder="/path/to/ggml-base.bin" />
+              <button className="primary" onClick={() => void addModelProfile()}>
+                保存并切换
+              </button>
+            </div>
+          </SettingRow>
+          <SettingRow title="当前路径" desc="也可以直接编辑当前模型路径">
+            <input value={config.whisper_model_path} onChange={(event) => updateConfig({ whisper_model_path: event.target.value })} />
+          </SettingRow>
+          <SettingRow title="Whisper CLI" desc="填写 whisper.cpp 可执行文件路径">
+            <input value={config.whisper_cli_path} onChange={(event) => updateConfig({ whisper_cli_path: event.target.value })} />
+          </SettingRow>
+          <SettingRow title="线程数" desc="本地识别使用的线程数，默认 8">
+            <input value={config.whisper_threads} onChange={(event) => updateConfig({ whisper_threads: event.target.value })} />
+          </SettingRow>
+          {config.whisper_model_profiles.length > 1 ? (
+            <SettingRow title="清理档案" desc="移除当前选中的模型档案，不会删除模型文件">
+              <button className="icon-button wide" onClick={() => void removeModelProfile(config.whisper_model_path)}>
+                移除当前档案
+              </button>
+            </SettingRow>
+          ) : null}
+          <SettingRow title="配置文件" desc={config.config_path || "首次保存后生成"}>
+            <button className="primary" onClick={() => void persistConfig()}>
+              <Save size={16} />
+              保存配置
+            </button>
+          </SettingRow>
+          {configMessage ? <div className="info-box">{configMessage}</div> : null}
+          {error ? <div className="error-box">{error}</div> : null}
+        </SettingsPanel>
+      ) : null}
+
+      {activeSection === "hotkey" ? (
+        <SettingsPanel title="快捷键" subtitle="录制任意键位组合，保存后可在任意窗口触发语音输入">
+          <SettingRow title="启用快捷键" desc="关闭后不会监听全局键盘快捷键">
+            <label className="switch-row">
+              <input
+                type="checkbox"
+                checked={config.shortcut_enabled}
+                onChange={(event) => {
+                  const nextConfig = { ...config, shortcut_enabled: event.target.checked };
+                  setConfig(nextConfig);
+                  void saveConfig(nextConfig).then(setConfig).catch((err) => setShortcutError(toUserFacingError(err)));
+                }}
+              />
+              <span>{config.shortcut_enabled ? "已启用" : "已关闭"}</span>
+            </label>
+          </SettingRow>
+          <SettingRow title="当前快捷键" desc={shortcutError || "按一次开始录音，再按一次结束并处理"}>
+            <div className="shortcut-control">
+              <kbd>{config.record_shortcut || "未设置"}</kbd>
+              <button className={isCapturingShortcut ? "primary danger" : "primary"} onClick={() => setIsCapturingShortcut(true)}>
+                <Keyboard size={16} />
+                {isCapturingShortcut ? "按下键位..." : "录制快捷键"}
+              </button>
+            </div>
+          </SettingRow>
+          <SettingRow title="推荐快捷键" desc="F1 经常被系统或其他软件占用，建议使用组合键">
+            <div className="shortcut-presets">
+              {SHORTCUT_PRESETS.map((shortcut) => (
+                <button key={shortcut} className="icon-button wide" onClick={() => void saveShortcut(shortcut)}>
+                  {shortcut}
+                </button>
+              ))}
+            </div>
+          </SettingRow>
+          <SettingRow title="保存方式" desc="录制到有效键位后会自动保存并立即重新注册">
+            <button className="primary" onClick={() => void persistConfig()}>
+              <Save size={16} />
+              保存当前配置
+            </button>
+          </SettingRow>
+          {configMessage ? <div className="info-box">{configMessage}</div> : null}
+          {shortcutError ? <div className="error-box">{shortcutError}</div> : null}
+        </SettingsPanel>
+      ) : null}
+
+      {activeSection === "ai" ? (
+        <SettingsPanel title="AI 设置" subtitle="DeepSeek 只处理转写后的文本，可本机直连或服务端代理">
+          <SettingRow title="API Key" desc="仅保存在本机配置文件中">
+            <input
+              type="password"
+              value={config.deepseek_api_key}
+              onChange={(event) => updateConfig({ deepseek_api_key: event.target.value })}
+              placeholder="sk-..."
+            />
+          </SettingRow>
+          <SettingRow title="DeepSeek 模型" desc="用于纠错、补标点和翻译">
+            <input value={config.deepseek_model} onChange={(event) => updateConfig({ deepseek_model: event.target.value })} />
+          </SettingRow>
+          <SettingRow title="DeepSeek 服务地址" desc="留空时本机直连；填写云端地址后由服务端代理调用">
+            <input
+              value={config.deepseek_endpoint}
+              onChange={(event) => updateConfig({ deepseek_endpoint: event.target.value })}
+              placeholder="http://10.254.81.32:10095"
+            />
+          </SettingRow>
+          <SettingRow title="实时翻译" desc="关闭后只进行 AI 纠错，不再调用翻译接口">
+            <label className="switch-row">
+              <input
+                type="checkbox"
+                checked={config.translation_enabled}
+                onChange={(event) => updateConfig({ translation_enabled: event.target.checked })}
+              />
+              <span>{config.translation_enabled ? "已启用" : "已关闭"}</span>
+            </label>
+          </SettingRow>
+          <SettingRow title="默认翻译目标" desc="首页也可以临时切换">
+            <select
+              value={config.target_language}
+              onChange={(event) => {
+                updateConfig({ target_language: event.target.value });
+                setTargetLanguage(event.target.value);
+              }}
+            >
+              <option value="中文">中文</option>
+              <option value="英文">英文</option>
+              <option value="日文">日文</option>
+              <option value="韩文">韩文</option>
+            </select>
+          </SettingRow>
+          <SettingRow title="保存 AI 设置" desc={config.deepseek_endpoint ? "使用服务端 DeepSeek 代理" : config.deepseek_key_configured ? "DeepSeek key 已配置" : "DeepSeek key 未配置"}>
+            <button className="primary" onClick={() => void persistConfig()}>
+              <Save size={16} />
+              保存配置
+            </button>
+          </SettingRow>
+          {configMessage ? <div className="info-box">{configMessage}</div> : null}
+          {error ? <div className="error-box">{error}</div> : null}
+        </SettingsPanel>
+      ) : null}
+    </main>
+  );
+}
+
+function VoiceOverlayWindow() {
+  const [overlay, setOverlay] = useState<VoiceOverlayState>({
+    stage: "idle",
+    status: "准备录音",
+    seconds: 0,
+    text: "按下快捷键开始语音输入",
+    level: 0.2
+  });
+
+  useEffect(() => {
+    document.documentElement.dataset.window = OVERLAY_LABEL;
+    document.body.dataset.window = OVERLAY_LABEL;
+    const currentWindow = getCurrentWindow();
+    void currentWindow.setAlwaysOnTop(true);
+    return () => {
+      delete document.documentElement.dataset.window;
+      delete document.body.dataset.window;
+    };
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<VoiceOverlayState>(OVERLAY_STATE_EVENT, (event) => {
+      setOverlay(event.payload);
+    }).then((handler) => {
+      unlisten = handler;
+    });
+    return () => unlisten?.();
+  }, []);
+
+  useEffect(() => {
+    if (overlay.stage !== "done" && overlay.stage !== "error") {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void getCurrentWindow().hide().catch(() => undefined);
+    }, 1800);
+    return () => window.clearTimeout(timer);
+  }, [overlay.stage]);
+
+  const level = overlay.level ?? 0;
+  const isActiveVoice = overlay.stage === "recording" && level > 0.08;
+  const bars = Array.from({ length: 16 }, (_, index) => {
+    const base = isActiveVoice ? 12 + ((index % 5) + 1) * 3 : 8 + (index % 4) * 2;
+    const wave = isActiveVoice ? Math.abs(Math.sin(index * 0.72 + overlay.seconds * 8.5)) : 0.18;
+    const height = Math.round(base + wave * 22 + level * 26);
+    return <span key={index} style={{ height }} />;
+  });
+
+  function closeOverlay(event: React.SyntheticEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    void closeVoiceOverlay().catch(() => undefined);
+    void emitTo(MAIN_LABEL, OVERLAY_CANCEL_EVENT).catch(() => undefined);
+    void getCurrentWindow().hide().catch(() => undefined);
+  }
+
+  function startOverlayDrag(event: React.MouseEvent<HTMLElement>) {
+    if (event.button !== 0) {
+      return;
+    }
+    const target = event.target as HTMLElement;
+    if (target.closest("button")) {
+      return;
+    }
+    void getCurrentWindow().startDragging().catch(() => undefined);
+  }
+
+  return (
+    <main className="voice-overlay-frame">
+      <section
+        className="voice-overlay-shell"
+        data-stage={overlay.stage}
+        data-active-voice={isActiveVoice ? "true" : "false"}
+        onMouseDown={startOverlayDrag}
+      >
+        <button
+          className="voice-overlay-close"
+          onMouseDown={closeOverlay}
+          onClick={closeOverlay}
+          title="关闭悬浮窗"
+          aria-label="关闭悬浮窗"
+        >
+          <X size={14} />
+        </button>
+        <div className="voice-ripple" aria-hidden="true">
+          <i />
+          <i />
+          <i />
+        </div>
+        <div className="voice-orb" aria-hidden="true">
+          {overlay.stage === "polishing" || overlay.stage === "recognized" || overlay.stage === "done" ? (
+            <Sparkles size={18} />
+          ) : overlay.stage === "stopping" ? (
+            <Pause size={18} />
+          ) : (
+            <Mic size={18} />
+          )}
+        </div>
+        <div className="voice-overlay-copy">
+          <strong>{overlay.status}</strong>
+          <span>{overlayTimeText(overlay)}</span>
+        </div>
+        <div className="voice-wave" aria-hidden="true">{bars}</div>
+        <p>{overlay.text || overlayText(overlay.stage)}</p>
+      </section>
+    </main>
+  );
+}
+
+function nextPaint() {
+  return new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+}
+
+function elapsedSeconds(startedAt: number) {
+  return Number(((performance.now() - startedAt) / 1000).toFixed(1));
+}
+
+function getSafeWindowLabel() {
+  try {
+    return getCurrentWindow().label;
+  } catch {
+    return "main";
+  }
+}
+
+function asrEngineName(config: AppConfig) {
+  return config.asr_engine === "funasr" ? "FunASR" : "Whisper";
+}
+
+function overlayStatus(stage: Stage) {
+  const status: Record<Stage, string> = {
+    idle: "准备录音",
+    recording: "正在监听语音",
+    stopping: "正在停止录音",
+    transcribing: "本地识别中",
+    recognized: "识别完成",
+    polishing: "AI 正在处理",
+    done: "处理完成",
+    error: "处理失败"
+  };
+  return status[stage];
+}
+
+function overlayText(stage: Stage) {
+  const text: Record<Stage, string> = {
+    idle: "按下快捷键开始语音输入",
+    recording: "再次按下快捷键停止录音",
+    stopping: "正在收束音频并准备识别",
+    transcribing: "Whisper 正在处理录音",
+    recognized: "识别完成，准备后续处理",
+    polishing: "正在纠错、补标点并翻译",
+    done: "结果已经写回主窗口",
+    error: "请回到主窗口查看错误详情"
+  };
+  return text[stage];
+}
+
+function overlayTimeText(overlay: VoiceOverlayState) {
+  const parts = [`${overlay.seconds.toFixed(1)}s`];
+  if (overlay.transcribeSeconds !== undefined) {
+    parts.push(`识别 ${overlay.transcribeSeconds.toFixed(1)}s`);
+  }
+  if (overlay.correctionSeconds !== undefined) {
+    parts.push(`纠错 ${overlay.correctionSeconds.toFixed(1)}s`);
+  }
+  if (overlay.translationSeconds !== undefined) {
+    parts.push(`翻译 ${overlay.translationSeconds.toFixed(1)}s`);
+  }
+  return parts.join(" · ");
+}
+
+function previewOverlayText(text: string) {
+  const compactText = text.replace(/\s+/g, " ").trim();
+  if (!compactText) {
+    return "处理完成";
+  }
+  return compactText.length > 34 ? `${compactText.slice(0, 34)}...` : compactText;
+}
+
+function activeModelProfile(config: AppConfig) {
+  return config.whisper_model_profiles.find((profile) => profile.path === config.whisper_model_path);
+}
+
+function modelNameFromPath(path: string) {
+  const name = path.split("/").pop()?.replace(/\.bin$/i, "");
+  return name || "自定义模型";
+}
+
+function StatusDot({ ok, label }: { ok: boolean; label: string }) {
+  return (
+    <span className={ok ? "status-dot ok" : "status-dot"}>
+      <i />
+      {label}
+    </span>
+  );
+}
+
+function TabButton({
+  active,
+  icon,
+  label,
+  onClick
+}: {
+  active: boolean;
+  icon: React.ReactNode;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button className={active ? "tab-button active" : "tab-button"} onClick={onClick}>
+      {icon}
+      {label}
+    </button>
+  );
+}
+
+function SettingsPanel({ title, subtitle, children }: { title: string; subtitle: string; children: React.ReactNode }) {
+  return (
+    <section className="settings-panel">
+      <header className="settings-head">
+        <h2>{title}</h2>
+        <p>{subtitle}</p>
+      </header>
+      <div className="settings-list">{children}</div>
+    </section>
+  );
+}
+
+function SettingRow({ title, desc, children }: { title: string; desc: string; children: React.ReactNode }) {
+  return (
+    <div className="setting-row">
+      <div className="setting-copy">
+        <strong>{title}</strong>
+        <span>{desc}</span>
+      </div>
+      <div className="setting-control">{children}</div>
+    </div>
+  );
+}
+
+function Pipeline({ stage }: { stage: Stage }) {
+  const steps = [
+    ["recording", "录音"],
+    ["stopping", "整理录音"],
+    ["transcribing", "本地识别"],
+    ["recognized", "识别完成"],
+    ["polishing", "纠错翻译"]
+  ] as const;
+  const activeIndex = steps.findIndex(([key]) => key === stage);
+
+  return (
+    <div className="pipeline">
+      {steps.map(([key, label], index) => (
+        <span
+          key={key}
+          className={stage === key ? "active" : stage === "done" || (activeIndex > index && activeIndex !== -1) ? "done" : ""}
+        >
+          {stage === key ? <Loader2 className="spin" size={14} /> : <i />}
+          {label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function ProcessingNotice({ stage, seconds }: { stage: Stage; seconds: number }) {
+  if (stage !== "stopping" && stage !== "transcribing" && stage !== "recognized" && stage !== "polishing") {
+    return null;
+  }
+  const processingCopy: Record<"stopping" | "transcribing" | "recognized" | "polishing", [string, string]> = {
+    stopping: ["正在整理录音", "正在结束麦克风采集并整理音频，通常只需要几秒。"],
+    transcribing: ["本地识别中", "Whisper 模型正在处理录音，模型越大等待越久，界面会保持响应。"],
+    recognized: ["识别完成", "本地转写已经完成，正在准备 AI 后续处理。"],
+    polishing: ["AI 正在处理", "正在处理转写文本，结果会自动写入右侧区域。"]
+  };
+  const copy = processingCopy[stage];
+  return (
+    <div className="processing-notice">
+      <Loader2 className="spin" size={17} />
+      <div>
+        <strong>{copy[0]}</strong>
+        <span>
+          {copy[1]} 已处理 {seconds.toFixed(1)}s
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function TimingStats({
+  transcribeSeconds,
+  correctionSeconds,
+  translationSeconds
+}: {
+  transcribeSeconds?: number;
+  correctionSeconds?: number;
+  translationSeconds?: number;
+}) {
+  if (transcribeSeconds === undefined && correctionSeconds === undefined && translationSeconds === undefined) {
+    return null;
+  }
+  return (
+    <div className="timing-stats">
+      <span>
+        <strong>{transcribeSeconds === undefined ? "--" : `${transcribeSeconds.toFixed(1)}s`}</strong>
+        本地识别
+      </span>
+      <span>
+        <strong>{correctionSeconds === undefined ? "--" : `${correctionSeconds.toFixed(1)}s`}</strong>
+        纠错文本
+      </span>
+      <span>
+        <strong>{translationSeconds === undefined ? "--" : `${translationSeconds.toFixed(1)}s`}</strong>
+        实时翻译
+      </span>
+    </div>
+  );
+}
+
+function TextBlock({ title, icon, value }: { title: string; icon: React.ReactNode; value: string }) {
+  return (
+    <article className="text-block">
+      <h2>
+        {icon}
+        {title}
+      </h2>
+      <p>{value}</p>
+    </article>
+  );
+}
+
+function emptyTranscriptText(stage: Stage) {
+  if (stage === "recording") {
+    return "正在收音，结束后会直接在本机执行识别";
+  }
+  if (stage === "stopping" || stage === "transcribing") {
+    return "本地模型正在识别录音，完成后会显示原始转写";
+  }
+  return `点击开始说话，录音最长 ${MAX_SECONDS} 秒`;
+}
+
+function emptyCorrectedText(stage: Stage) {
+  if (stage === "polishing") {
+    return "正在纠正语音错词、断句和标点";
+  }
+  if (stage === "stopping" || stage === "transcribing") {
+    return "识别完成后会自动进入 AI 纠错";
+  }
+  return "识别完成后自动纠正语音错词";
+}
+
+function emptyTranslationText(stage: Stage) {
+  if (stage === "polishing") {
+    return "正在生成目标语言版本";
+  }
+  if (stage === "stopping" || stage === "transcribing") {
+    return "AI 处理完成后会显示翻译结果";
+  }
+  return "纠错完成后自动翻译";
+}
+
+function toUserFacingError(error: unknown) {
+  const message = String(error);
+  if (
+    message.includes("Cannot read properties of undefined") ||
+    message.includes("__TAURI_INTERNALS__") ||
+    message.includes("Tauri API")
+  ) {
+    return "当前页面未运行在 Tauri 桌面环境中：语音输入需要打开桌面应用，普通浏览器预览只能查看首页布局。";
+  }
+  if (
+    message.includes("not allowed by the user agent") ||
+    message.includes("denied permission") ||
+    message.includes("Permission denied") ||
+    message.includes("not permitted")
+  ) {
+    return "麦克风权限不可用：请在 macOS 系统设置 > 隐私与安全性 > 麦克风 中允许本应用访问麦克风，然后重新启动应用。";
+  }
+  if (message.includes("未找到默认麦克风输入设备") || message.includes("No input device")) {
+    return "未找到默认麦克风：请连接或启用输入设备，并在系统声音设置中选择默认输入。";
+  }
+  if (message.includes("Device not available") || message.includes("in use")) {
+    return "麦克风暂时不可用：可能被其他应用占用，请关闭占用麦克风的软件后重试。";
+  }
+  if (message.includes("RegisterEventHotKey failed") || message.includes("Unable to register hotkey")) {
+    return "快捷键已被系统或其他软件占用：请在“快捷键”页换成推荐组合键，例如 CommandOrControl+Alt+Space。";
+  }
+  if (message.includes("DeepSeek key 未配置")) {
+    return "DeepSeek key 未配置：请在 AI 设置中填写本机 API Key，或填写 DeepSeek 服务地址走服务端代理。";
+  }
+  if (message.includes("WHISPER_MODEL_PATH")) {
+    return "Whisper 模型未配置或文件不存在：请进入“模型设置”填写有效的模型文件路径。";
+  }
+  return message;
+}
+
+function normalizeShortcut(event: KeyboardEvent) {
+  const key = normalizeKey(event.key);
+  if (!key) {
+    return "";
+  }
+  const parts: string[] = [];
+  if (event.metaKey || event.ctrlKey) {
+    parts.push("CommandOrControl");
+  }
+  if (event.altKey) {
+    parts.push("Alt");
+  }
+  if (event.shiftKey) {
+    parts.push("Shift");
+  }
+  parts.push(key);
+  return parts.join("+");
+}
+
+function normalizeKey(key: string) {
+  if (["Control", "Meta", "Shift", "Alt"].includes(key)) {
+    return "";
+  }
+  if (key === " ") {
+    return "Space";
+  }
+  if (key.length === 1) {
+    return key.toUpperCase();
+  }
+  const keyMap: Record<string, string> = {
+    ArrowUp: "Up",
+    ArrowDown: "Down",
+    ArrowLeft: "Left",
+    ArrowRight: "Right",
+    Escape: "Escape",
+    Enter: "Enter",
+    Tab: "Tab",
+    Backspace: "Backspace",
+    Delete: "Delete",
+    Insert: "Insert",
+    Home: "Home",
+    End: "End",
+    PageUp: "PageUp",
+    PageDown: "PageDown"
+  };
+  return keyMap[key] || key;
+}

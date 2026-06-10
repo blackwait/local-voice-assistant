@@ -1,0 +1,7 @@
+numpy<2
+urllib3<2
+funasr
+modelscope
+fastapi
+uvicorn[standard]
+python-multipart

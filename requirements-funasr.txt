@@ -1,0 +1,9 @@
+torch
+torchaudio==2.2.2
+numpy<2
+urllib3<2
+funasr
+modelscope
+fastapi
+uvicorn[standard]
+python-multipart

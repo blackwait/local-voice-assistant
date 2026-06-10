@@ -1,0 +1,16 @@
+[Unit]
+Description=Local Voice Assistant Cloud Services
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/local-voice-services
+EnvironmentFile=/opt/local-voice-services/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/local-voice-services/.venv/bin/python /opt/local-voice-services/cloud_voice_service.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

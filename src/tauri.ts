@@ -1,0 +1,105 @@
+import { invoke } from "@tauri-apps/api/core";
+
+export interface AppConfig {
+  whisper_cli_path: string;
+  whisper_model_path: string;
+  whisper_model_profiles: WhisperModelProfile[];
+  whisper_threads: string;
+  asr_engine: string;
+  funasr_endpoint: string;
+  funasr_model: string;
+  funasr_device: string;
+  deepseek_api_key: string;
+  deepseek_model: string;
+  deepseek_endpoint: string;
+  deepseek_key_configured: boolean;
+  translation_enabled: boolean;
+  target_language: string;
+  config_path: string;
+  record_shortcut: string;
+  shortcut_enabled: boolean;
+}
+
+export interface WhisperModelProfile {
+  name: string;
+  path: string;
+  speed_hint: string;
+}
+
+export interface AssistantResult {
+  corrected_text: string;
+  translation: string;
+  notes: string[];
+  confidence: "high" | "medium" | "low";
+}
+
+export interface CorrectionResult {
+  corrected_text: string;
+  notes: string[];
+  confidence: "high" | "medium" | "low";
+}
+
+export interface FunAsrHealthView {
+  ok: boolean;
+  message: string;
+  model: string;
+  device: string;
+}
+
+export function getAppConfig() {
+  return invoke<AppConfig>("get_app_config");
+}
+
+export function loadConfig() {
+  return invoke<AppConfig>("load_config");
+}
+
+export function saveConfig(config: AppConfig) {
+  return invoke<AppConfig>("save_config", { config });
+}
+
+export function startNativeRecording() {
+  return invoke<void>("start_native_recording");
+}
+
+export function cancelNativeRecording() {
+  return invoke<void>("cancel_native_recording");
+}
+
+export function closeVoiceOverlay() {
+  return invoke<void>("close_voice_overlay");
+}
+
+export function stopRecordingAndTranscribe() {
+  return invoke<string>("stop_recording_and_transcribe");
+}
+
+export function startFunasrService() {
+  return invoke<string>("start_funasr_service");
+}
+
+export function checkFunasrService() {
+  return invoke<FunAsrHealthView>("check_funasr_service");
+}
+
+export function polishText(input: string) {
+  return invoke<CorrectionResult>("polish_text", { input });
+}
+
+export function translateText(input: string, targetLanguage: string) {
+  return invoke<string>("translate_text", {
+    input,
+    targetLanguage
+  });
+}
+
+export function outputTextToCursor(text: string) {
+  return invoke<void>("output_text_to_cursor", { text });
+}
+
+export function polishAndTranslate(input: string, targetLanguage: string) {
+  return invoke<AssistantResult>("polish_and_translate", {
+    input,
+    targetLanguage
+  });
+}
