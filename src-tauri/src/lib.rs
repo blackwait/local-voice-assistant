@@ -1152,6 +1152,7 @@ fn register_record_shortcut(app: &AppHandle, config: &AppConfig) -> Result<(), S
                     return;
                 }
 
+                #[cfg(target_os = "macos")]
                 remember_frontmost_target_app(app);
                 let result = app
                     .try_state::<RecorderState>()
@@ -1356,6 +1357,8 @@ fn emit_overlay_state(
 fn prepare_voice_overlay(overlay: &tauri::WebviewWindow) {
     #[cfg(target_os = "macos")]
     let _ = overlay.set_focusable(false);
+    #[cfg(not(target_os = "macos"))]
+    let _ = overlay;
 }
 
 fn emit_overlay_state_to_window(
