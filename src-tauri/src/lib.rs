@@ -683,6 +683,9 @@ mod macos_input {
     }
 
     pub fn prompt_accessibility_once() -> bool {
+        if accessibility_trusted() {
+            return true;
+        }
         if ACCESSIBILITY_PROMPTED.swap(true, Ordering::SeqCst) {
             return false;
         }
@@ -2118,10 +2121,6 @@ pub fn run() {
             let config = load_or_create_config(&handle)?;
             if let Err(error) = register_record_shortcut(&handle, &config) {
                 eprintln!("record shortcut register failed: {error}");
-            }
-            #[cfg(target_os = "macos")]
-            if !macos_input::accessibility_trusted() {
-                macos_input::prompt_accessibility_once();
             }
             Ok(())
         })
