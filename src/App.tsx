@@ -51,24 +51,15 @@ const OVERLAY_STATE_EVENT = "voice-overlay-state";
 const OVERLAY_CANCEL_EVENT = "voice-overlay-cancel";
 const RECORD_SHORTCUT_EVENT = "record-shortcut-pressed";
 const RECORD_TRANSCRIBED_EVENT = "record-transcribed";
+const DEFAULT_WHISPER_MODEL_PATH = "models/ggml-tiny.bin";
 const DEFAULT_CONFIG: AppConfig = {
   whisper_cli_path: "/usr/local/bin/whisper-cli",
-  whisper_model_path: "/Users/black/IdeaProjects/voice-transcriber-tauri/models/ggml-base.bin",
+  whisper_model_path: DEFAULT_WHISPER_MODEL_PATH,
   whisper_model_profiles: [
     {
-      name: "Base 快速",
-      path: "/Users/black/IdeaProjects/voice-transcriber-tauri/models/ggml-base.bin",
-      speed_hint: "更快，适合日常短句输入"
-    },
-    {
-      name: "Large v3 Turbo 均衡",
-      path: "/Users/black/IdeaProjects/voice-transcriber-tauri/models/ggml-large-v3-turbo.bin",
-      speed_hint: "更准，速度中等"
-    },
-    {
-      name: "Large v3 高精度",
-      path: "/Users/black/IdeaProjects/voice-transcriber-tauri/models/ggml-large-v3.bin",
-      speed_hint: "更慢，适合准确率优先"
+      name: "Tiny 内置轻量",
+      path: DEFAULT_WHISPER_MODEL_PATH,
+      speed_hint: "最轻量，适合快速语音输入"
     }
   ],
   whisper_threads: "8",
@@ -1490,8 +1481,8 @@ function toUserFacingError(error: unknown) {
   if (message.includes("DeepSeek key 未配置")) {
     return "DeepSeek key 未配置：请在 AI 设置中填写本机 API Key，或填写 DeepSeek 服务地址走服务端代理。";
   }
-  if (message.includes("WHISPER_MODEL_PATH")) {
-    return "Whisper 模型未配置或文件不存在：请进入“模型设置”填写有效的模型文件路径。";
+  if (message.includes("WHISPER_MODEL_PATH") || message.includes("本地 Whisper 模型不可用")) {
+    return "本地 Whisper 模型不可用：应用会优先使用 FunASR；如需离线识别，可在“模型设置”填写有效模型路径。";
   }
   return message;
 }

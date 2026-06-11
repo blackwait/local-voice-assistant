@@ -21,10 +21,12 @@ const RECORD_SHORTCUT_EVENT: &str = "record-shortcut-pressed";
 const RECORD_TRANSCRIBED_EVENT: &str = "record-transcribed";
 const OVERLAY_LABEL: &str = "voice-overlay";
 const OVERLAY_STATE_EVENT: &str = "voice-overlay-state";
+const BUNDLED_WHISPER_MODEL_RELATIVE_PATH: &str = "models/ggml-tiny.bin";
+const LEGACY_VOICE_TRANSCRIBER_MODEL_DIR: &str = "/Users/black/IdeaProjects/voice-transcriber-tauri/models/";
 
 #[derive(Debug, Error)]
 enum AppError {
-    #[error("请先配置 WHISPER_MODEL_PATH，且模型文件必须存在")]
+    #[error("本地 Whisper 模型不可用")]
     MissingWhisperModel,
     #[error("本地 whisper 命令执行失败：{0}")]
     WhisperFailed(String),
@@ -198,7 +200,7 @@ fn load_config(app: AppHandle) -> Result<AppConfigView, String> {
 
 #[tauri::command]
 fn save_config(app: AppHandle, mut config: AppConfig) -> Result<AppConfigView, String> {
-    normalize_config(&mut config);
+    normalize_config(&app, &mut config);
     save_app_config(&app, &config)?;
     register_record_shortcut(&app, &config)?;
     Ok(config.to_view(config_path(&app)?))
@@ -766,18 +768,18 @@ fn load_or_create_config(app: &AppHandle) -> Result<AppConfig, String> {
     let path = config_path(app)?;
     if !path.exists() {
         let mut config = AppConfig::default();
-        normalize_config(&mut config);
+        normalize_config(app, &mut config);
         save_app_config(app, &config)?;
         return Ok(config);
     }
     let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
     let mut config = serde_json::from_str::<AppConfig>(&text).map_err(|error| error.to_string())?;
-    normalize_config(&mut config);
+    normalize_config(app, &mut config);
     save_app_config(app, &config)?;
     Ok(config)
 }
 
-fn normalize_config(config: &mut AppConfig) {
+fn normalize_config(app: &AppHandle, config: &mut AppConfig) {
     if config.asr_engine.trim().is_empty() {
         config.asr_engine = "funasr".to_string();
     }
@@ -799,14 +801,27 @@ fn normalize_config(config: &mut AppConfig) {
     if config.record_shortcut.trim() == "F1" {
         config.record_shortcut = default_record_shortcut();
     }
-    let had_no_model_profiles = config.whisper_model_profiles.is_empty();
+    config
+        .whisper_model_profiles
+        .retain(|profile| !is_legacy_voice_transcriber_model_path(profile.path.trim()));
+    let default_model_path = default_whisper_model_path_for_app(app);
+    let default_profiles = default_model_profiles_for_app(app);
     if config.whisper_model_profiles.is_empty() {
-        config.whisper_model_profiles = default_model_profiles();
+        config.whisper_model_profiles = default_profiles.clone();
     }
-    if had_no_model_profiles {
-        prefer_fast_model_for_existing_large_config(config);
+    if !config
+        .whisper_model_profiles
+        .iter()
+        .any(|profile| profile.path.trim() == default_model_path)
+    {
+        config.whisper_model_profiles.extend(default_profiles);
     }
-    if config.whisper_model_path.trim().is_empty() {
+    if config.whisper_model_path.trim().is_empty()
+        || is_legacy_voice_transcriber_model_path(config.whisper_model_path.trim())
+    {
+        config.whisper_model_path = default_model_path;
+    }
+    if !Path::new(config.whisper_model_path.trim()).is_file() {
         if let Some(profile) = first_existing_model_profile(&config.whisper_model_profiles) {
             config.whisper_model_path = profile.path.clone();
         }
@@ -814,16 +829,8 @@ fn normalize_config(config: &mut AppConfig) {
     upsert_current_model_profile(config);
 }
 
-fn prefer_fast_model_for_existing_large_config(config: &mut AppConfig) {
-    let fast_model_path = "/Users/black/IdeaProjects/voice-transcriber-tauri/models/ggml-base.bin";
-    if Path::new(fast_model_path).is_file()
-        && config
-            .whisper_model_path
-            .trim()
-            .ends_with("ggml-large-v3-turbo.bin")
-    {
-        config.whisper_model_path = fast_model_path.to_string();
-    }
+fn is_legacy_voice_transcriber_model_path(path: &str) -> bool {
+    path.contains(LEGACY_VOICE_TRANSCRIBER_MODEL_DIR)
 }
 
 fn upsert_current_model_profile(config: &mut AppConfig) {
@@ -1129,7 +1136,15 @@ fn transcribe_audio(audio: Vec<u8>, config: &AppConfig) -> Result<String, AppErr
     if config.asr_engine.trim().eq_ignore_ascii_case("funasr") {
         return transcribe_with_funasr(audio, config);
     }
+    if !has_valid_whisper_model(config) {
+        return transcribe_with_funasr(audio, config);
+    }
     transcribe_with_whisper(audio, config)
+}
+
+fn has_valid_whisper_model(config: &AppConfig) -> bool {
+    let model_path = config.whisper_model_path.trim();
+    !model_path.is_empty() && Path::new(model_path).is_file()
 }
 
 fn transcribe_with_whisper(audio: Vec<u8>, config: &AppConfig) -> Result<String, AppError> {
@@ -1558,40 +1573,59 @@ fn default_translation_enabled() -> bool {
 
 fn default_whisper_model_path() -> String {
     env::var("WHISPER_MODEL_PATH").unwrap_or_else(|_| {
-        first_existing_path(&[
-            "/Users/black/IdeaProjects/voice-transcriber-tauri/models/ggml-base.bin",
-            "/Users/black/IdeaProjects/voice-transcriber-tauri/models/ggml-large-v3-turbo.bin",
-            "/Users/black/IdeaProjects/voice-transcriber-tauri/models/ggml-large-v3.bin",
-        ])
+        local_project_whisper_model_path()
+            .to_string_lossy()
+            .to_string()
     })
 }
 
 fn default_model_profiles() -> Vec<WhisperModelProfile> {
-    [
-        (
-            "Base 快速",
-            "/Users/black/IdeaProjects/voice-transcriber-tauri/models/ggml-base.bin",
-            "更快，适合日常短句输入",
-        ),
-        (
-            "Large v3 Turbo 均衡",
-            "/Users/black/IdeaProjects/voice-transcriber-tauri/models/ggml-large-v3-turbo.bin",
-            "更准，速度中等",
-        ),
-        (
-            "Large v3 高精度",
-            "/Users/black/IdeaProjects/voice-transcriber-tauri/models/ggml-large-v3.bin",
-            "更慢，适合准确率优先",
-        ),
-    ]
-    .into_iter()
-    .filter(|(_, path, _)| Path::new(path).is_file())
-    .map(|(name, path, speed_hint)| WhisperModelProfile {
-        name: name.to_string(),
-        path: path.to_string(),
-        speed_hint: speed_hint.to_string(),
+    vec![default_tiny_model_profile(default_whisper_model_path())]
+}
+
+fn default_whisper_model_path_for_app(app: &AppHandle) -> String {
+    env::var("WHISPER_MODEL_PATH").unwrap_or_else(|_| {
+        bundled_whisper_model_path(app)
+            .or_else(|| {
+                let path = local_project_whisper_model_path();
+                path.is_file()
+                    .then(|| path.to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| {
+                local_project_whisper_model_path()
+                    .to_string_lossy()
+                    .to_string()
+            })
     })
-    .collect()
+}
+
+fn default_model_profiles_for_app(app: &AppHandle) -> Vec<WhisperModelProfile> {
+    vec![default_tiny_model_profile(default_whisper_model_path_for_app(app))]
+}
+
+fn default_tiny_model_profile(path: String) -> WhisperModelProfile {
+    WhisperModelProfile {
+        name: "Tiny 内置轻量".to_string(),
+        path,
+        speed_hint: "最轻量，适合快速语音输入".to_string(),
+    }
+}
+
+fn bundled_whisper_model_path(app: &AppHandle) -> Option<String> {
+    app.path()
+        .resolve(
+            BUNDLED_WHISPER_MODEL_RELATIVE_PATH,
+            tauri::path::BaseDirectory::Resource,
+        )
+        .ok()
+        .filter(|path| path.is_file())
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+fn local_project_whisper_model_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(BUNDLED_WHISPER_MODEL_RELATIVE_PATH)
 }
 
 fn model_name_from_path(path: &str) -> String {

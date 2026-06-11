@@ -10,3 +10,4 @@ logs
 *.log
 __pycache__
 *.pyc
+models/*.bin
