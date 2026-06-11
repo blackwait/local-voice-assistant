@@ -1,13 +1,18 @@
 import { createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { fileURLToPath } from "node:url";
 
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const modelPath = resolve(rootDir, "models", "ggml-tiny.bin");
 const tmpPath = `${modelPath}.tmp`;
-const modelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin";
+const modelUrls = [
+  process.env.WHISPER_TINY_MODEL_URL,
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin"
+].filter(Boolean);
 const minSizeBytes = 70_000_000;
+const maxAttempts = 3;
 
 mkdirSync(dirname(modelPath), { recursive: true });
 
@@ -24,12 +29,55 @@ if (existsSync(tmpPath)) {
   rmSync(tmpPath);
 }
 
-console.log(`Downloading Whisper tiny model to ${modelPath}`);
-const response = await fetch(modelUrl, { redirect: "follow" });
-if (!response.ok || !response.body) {
-  throw new Error(`Failed to download model: ${response.status} ${response.statusText}`);
+let lastError;
+for (const modelUrl of modelUrls) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await downloadModel(modelUrl, attempt);
+      console.log(`Whisper tiny model ready: ${modelPath}`);
+      process.exit(0);
+    } catch (error) {
+      lastError = error;
+      if (existsSync(tmpPath)) {
+        rmSync(tmpPath);
+      }
+      console.warn(
+        `Download attempt ${attempt}/${maxAttempts} failed for ${modelUrl}: ${formatError(error)}`
+      );
+    }
+  }
 }
 
-await pipeline(response.body, createWriteStream(tmpPath));
-renameSync(tmpPath, modelPath);
-console.log(`Whisper tiny model ready: ${modelPath}`);
+throw new Error(`Failed to download Whisper tiny model: ${formatError(lastError)}`);
+
+async function downloadModel(modelUrl, attempt) {
+  console.log(`Downloading Whisper tiny model to ${modelPath} (attempt ${attempt}/${maxAttempts})`);
+  const response = await fetch(modelUrl, {
+    redirect: "follow",
+    headers: {
+      "user-agent": "local-voice-assistant-release-build"
+    }
+  });
+  if (!response.ok || !response.body) {
+    throw new Error(`HTTP ${response.status} ${response.statusText}`);
+  }
+
+  await pipeline(Readable.fromWeb(response.body), createWriteStream(tmpPath));
+
+  const downloadedSize = statSync(tmpPath).size;
+  if (downloadedSize < minSizeBytes) {
+    throw new Error(`downloaded file is too small: ${downloadedSize} bytes`);
+  }
+
+  renameSync(tmpPath, modelPath);
+}
+
+function formatError(error) {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === "string") {
+    return error;
+  }
+  return "unknown error";
+}

@@ -61,6 +61,15 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Cache Whisper tiny model
+        uses: actions/cache@v4
+        with:
+          path: models/ggml-tiny.bin
+          key: ${{ runner.os }}-whisper-tiny-v1
+
+      - name: Download Whisper tiny model
+        run: node scripts/download_whisper_tiny_model.mjs
+
       - name: Build and publish Tauri bundles
         uses: tauri-apps/tauri-action@v0
         env:
