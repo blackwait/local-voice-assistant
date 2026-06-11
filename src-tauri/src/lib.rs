@@ -431,6 +431,8 @@ fn run_recording_thread(
 
 fn setup_recording_stream(app: AppHandle) -> Result<(cpal::Stream, Arc<Mutex<Vec<f32>>>, u32, Instant), AppError>
 {
+    ensure_microphone_permission()?;
+
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -481,6 +483,86 @@ fn setup_recording_stream(app: AppHandle) -> Result<(cpal::Stream, Arc<Mutex<Vec
         .play()
         .map_err(|error| AppError::Audio(error.to_string()))?;
     Ok((stream, samples, sample_rate, started_at))
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_microphone_permission() -> Result<(), AppError> {
+    macos_microphone_permission::ensure_authorized()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_microphone_permission() -> Result<(), AppError> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+mod macos_microphone_permission {
+    use super::AppError;
+    use block2::{DynBlock, RcBlock};
+    use objc2::runtime::{AnyClass, Bool};
+    use objc2::msg_send;
+    use objc2_foundation::NSString;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const AV_AUTHORIZATION_STATUS_NOT_DETERMINED: isize = 0;
+    const AV_AUTHORIZATION_STATUS_RESTRICTED: isize = 1;
+    const AV_AUTHORIZATION_STATUS_DENIED: isize = 2;
+    const AV_AUTHORIZATION_STATUS_AUTHORIZED: isize = 3;
+
+    #[link(name = "AVFoundation", kind = "framework")]
+    extern "C" {
+        static AVMediaTypeAudio: &'static NSString;
+    }
+
+    pub fn ensure_authorized() -> Result<(), AppError> {
+        let device_class = AnyClass::get(c"AVCaptureDevice").ok_or_else(|| {
+            AppError::Audio("获取录音授权显示失败：AVFoundation 不可用".to_string())
+        })?;
+        let media_type = unsafe { AVMediaTypeAudio };
+        let status: isize = unsafe {
+            msg_send![device_class, authorizationStatusForMediaType: media_type]
+        };
+
+        match status {
+            AV_AUTHORIZATION_STATUS_AUTHORIZED => Ok(()),
+            AV_AUTHORIZATION_STATUS_NOT_DETERMINED => request_access(device_class, media_type),
+            AV_AUTHORIZATION_STATUS_DENIED => Err(AppError::Audio(
+                "麦克风权限已被拒绝：请在 macOS 系统设置 > 隐私与安全性 > 麦克风 中允许本应用访问麦克风，然后重新启动应用。".to_string(),
+            )),
+            AV_AUTHORIZATION_STATUS_RESTRICTED => Err(AppError::Audio(
+                "麦克风权限受系统限制：请检查屏幕使用时间、MDM 或隐私限制后重试。".to_string(),
+            )),
+            _ => Err(AppError::Audio(format!("获取录音授权显示失败：未知授权状态 {status}"))),
+        }
+    }
+
+    fn request_access(device_class: &AnyClass, media_type: &NSString) -> Result<(), AppError> {
+        let (tx, rx) = mpsc::channel::<bool>();
+        let handler = RcBlock::new(move |granted: Bool| {
+            let _ = tx.send(granted.as_bool());
+        });
+        let handler: &DynBlock<dyn Fn(Bool)> = &handler;
+
+        let _: () = unsafe {
+            msg_send![
+                device_class,
+                requestAccessForMediaType: media_type,
+                completionHandler: handler
+            ]
+        };
+
+        let granted = rx.recv_timeout(Duration::from_secs(30)).map_err(|_| {
+            AppError::Audio("获取录音授权显示失败：等待用户授权超时".to_string())
+        })?;
+        if granted {
+            Ok(())
+        } else {
+            Err(AppError::Audio(
+                "麦克风权限未授权：请在 macOS 系统设置 > 隐私与安全性 > 麦克风 中允许本应用访问麦克风，然后重新启动应用。".to_string(),
+            ))
+        }
+    }
 }
 
 fn finish_recording(
