@@ -18,6 +18,7 @@ export interface AppConfig {
   config_path: string;
   record_shortcut: string;
   shortcut_enabled: boolean;
+  polish_prompt: string;
 }
 
 export interface WhisperModelProfile {
@@ -84,6 +85,10 @@ export function checkFunasrService() {
 
 export function polishText(input: string) {
   return invoke<CorrectionResult>("polish_text", { input });
+}
+
+export function getDefaultPolishPrompt() {
+  return invoke<string>("default_polish_prompt");
 }
 
 export function translateText(input: string, targetLanguage: string) {

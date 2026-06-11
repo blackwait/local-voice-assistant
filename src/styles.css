@@ -348,6 +348,48 @@ select {
   width: 100%;
 }
 
+.setting-row.wide {
+  grid-template-columns: 1fr;
+  gap: 14px;
+  align-items: stretch;
+}
+
+.setting-row.wide .setting-control {
+  justify-content: stretch;
+}
+
+.prompt-editor {
+  display: grid;
+  gap: 10px;
+  width: 100%;
+}
+
+.prompt-textarea {
+  width: 100%;
+  min-height: 220px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 12px 14px;
+  border: 1px solid rgba(23, 32, 27, 0.18);
+  border-radius: 8px;
+  background: #fffdf5;
+  color: #17201b;
+}
+
+.prompt-textarea:focus {
+  outline: none;
+  border-color: rgba(23, 32, 27, 0.4);
+}
+
+.prompt-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .model-profile-list {
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
 }

@@ -5,7 +5,7 @@ import os
 import tempfile
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -16,6 +16,7 @@ from funasr.utils.postprocess_utils import rich_transcription_postprocess
 
 class PolishRequest(BaseModel):
     input: str
+    prompt: Optional[str] = None
 
 
 class TranslateRequest(BaseModel):
@@ -93,7 +94,8 @@ async def transcribe(file: UploadFile = File(...)) -> dict[str, str]:
 
 @app.post("/polish")
 def polish(request: PolishRequest) -> dict[str, Any]:
-    content = call_deepseek(request.input, correction_prompt(), json_object=True)
+    system_prompt = request.prompt.strip() if request.prompt and request.prompt.strip() else correction_prompt()
+    content = call_deepseek(request.input, system_prompt, json_object=True)
     if not content.strip():
         return fallback_correction(request.input, "AI 纠错返回空内容，已保留识别文本。")
     try:

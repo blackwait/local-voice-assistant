@@ -9,6 +9,7 @@ import {
   cancelNativeRecording,
   checkFunasrService,
   closeVoiceOverlay,
+  getDefaultPolishPrompt,
   loadConfig,
   outputTextToCursor,
   polishText,
@@ -75,7 +76,8 @@ const DEFAULT_CONFIG: AppConfig = {
   target_language: "中文",
   config_path: "",
   record_shortcut: "CommandOrControl+1",
-  shortcut_enabled: true
+  shortcut_enabled: true,
+  polish_prompt: ""
 };
 const SHORTCUT_PRESETS = ["CommandOrControl+1", "CommandOrControl+Shift+Space", "CommandOrControl+Alt+Space", "CommandOrControl+Shift+R"];
 
@@ -564,6 +566,18 @@ function MainApp() {
       setConfig(saved);
       setTargetLanguage(saved.target_language || targetLanguage);
       setConfigMessage("配置已保存");
+    } catch (err) {
+      setConfigMessage("");
+      setError(toUserFacingError(err));
+    }
+  }
+
+  async function resetPolishPrompt() {
+    setError("");
+    try {
+      const defaultPrompt = await getDefaultPolishPrompt();
+      updateConfig({ polish_prompt: defaultPrompt });
+      setConfigMessage("已载入默认润色提示词，请点击保存使其生效");
     } catch (err) {
       setConfigMessage("");
       setError(toUserFacingError(err));
@@ -1062,6 +1076,37 @@ function MainApp() {
               <span>{config.translation_enabled ? "已启用" : "已关闭"}</span>
             </label>
           </SettingRow>
+          <div className="setting-row wide">
+            <div className="setting-copy">
+              <strong>AI 润色提示词</strong>
+              <span>
+                自定义纠错/润色时发给 DeepSeek 的系统提示词，可随时编辑并保存。需保留 JSON 输出约定
+                （corrected_text / notes / confidence），否则可能解析失败。走服务端代理时，需要服务端运行最新版才会生效。
+              </span>
+            </div>
+            <div className="setting-control">
+              <div className="prompt-editor">
+                <textarea
+                  className="prompt-textarea"
+                  value={config.polish_prompt}
+                  onChange={(event) => updateConfig({ polish_prompt: event.target.value })}
+                  rows={12}
+                  spellCheck={false}
+                  placeholder="自定义润色提示词，留空时使用内置默认"
+                />
+                <div className="prompt-actions">
+                  <button className="icon-button wide" onClick={() => void resetPolishPrompt()}>
+                    <RotateCcw size={16} />
+                    恢复默认
+                  </button>
+                  <button className="primary" onClick={() => void persistConfig()}>
+                    <Save size={16} />
+                    保存提示词
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
           <SettingRow title="默认翻译目标" desc="首页也可以临时切换">
             <select
               value={config.target_language}

@@ -61,6 +61,8 @@ struct AppConfig {
     target_language: String,
     record_shortcut: String,
     shortcut_enabled: bool,
+    #[serde(default)]
+    polish_prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +107,7 @@ impl Default for AppConfig {
             target_language: "中文".to_string(),
             record_shortcut: default_record_shortcut(),
             shortcut_enabled: true,
+            polish_prompt: String::new(),
         }
     }
 }
@@ -128,6 +131,7 @@ struct AppConfigView {
     config_path: String,
     record_shortcut: String,
     shortcut_enabled: bool,
+    polish_prompt: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -282,6 +286,11 @@ fn start_funasr_service(app: AppHandle) -> Result<String, String> {
         .spawn()
         .map_err(|error| format!("启动 FunASR 服务失败：{error}"))?;
     Ok(format!("FunASR 服务启动中，日志：{}", log_path.display()))
+}
+
+#[tauri::command]
+fn default_polish_prompt() -> String {
+    build_correction_prompt()
 }
 
 #[tauri::command]
@@ -567,6 +576,56 @@ mod macos_microphone_permission {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod macos_input {
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+    use core_foundation::string::{CFString, CFStringRef};
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    // kVK_ANSI_V，用于模拟 Command+V 粘贴。
+    const KEY_CODE_V: u16 = 0x09;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        static kAXTrustedCheckOptionPrompt: CFStringRef;
+        fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
+        fn AXIsProcessTrusted() -> bool;
+    }
+
+    pub fn accessibility_trusted() -> bool {
+        unsafe { AXIsProcessTrusted() }
+    }
+
+    // 触发系统辅助功能授权引导框，并把当前 app 加入辅助功能列表。
+    pub fn prompt_accessibility() -> bool {
+        unsafe {
+            let key = CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt);
+            let value = CFBoolean::true_value();
+            let options = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), value.as_CFType())]);
+            AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef())
+        }
+    }
+
+    // 进程内直接发送 Command+V，权限归属当前 app 而非子进程 osascript。
+    pub fn send_command_v() -> Result<(), String> {
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .map_err(|_| "创建键盘事件源失败".to_string())?;
+        let key_down = CGEvent::new_keyboard_event(source.clone(), KEY_CODE_V, true)
+            .map_err(|_| "创建按键事件失败".to_string())?;
+        key_down.set_flags(CGEventFlags::CGEventFlagCommand);
+        key_down.post(CGEventTapLocation::HID);
+
+        let key_up = CGEvent::new_keyboard_event(source, KEY_CODE_V, false)
+            .map_err(|_| "创建按键事件失败".to_string())?;
+        key_up.set_flags(CGEventFlags::CGEventFlagCommand);
+        key_up.post(CGEventTapLocation::HID);
+        Ok(())
+    }
+}
+
 fn finish_recording(
     samples: Arc<Mutex<Vec<f32>>>,
     sample_rate: u32,
@@ -759,6 +818,7 @@ impl AppConfig {
             config_path: config_path.display().to_string(),
             record_shortcut: self.record_shortcut.clone(),
             shortcut_enabled: self.shortcut_enabled,
+            polish_prompt: self.polish_prompt.clone(),
         }
     }
 }
@@ -782,6 +842,9 @@ fn load_or_create_config(app: &AppHandle) -> Result<AppConfig, String> {
 fn normalize_config(app: &AppHandle, config: &mut AppConfig) {
     if config.asr_engine.trim().is_empty() {
         config.asr_engine = "funasr".to_string();
+    }
+    if config.polish_prompt.trim().is_empty() {
+        config.polish_prompt = build_correction_prompt();
     }
     if config.funasr_endpoint.trim().is_empty() {
         config.funasr_endpoint = "http://10.254.81.32:10095".to_string();
@@ -1102,6 +1165,18 @@ fn activate_process(process_name: &str) -> Result<(), AppError> {
     run_osascript(&script, "切回原输入应用失败")
 }
 
+#[cfg(target_os = "macos")]
+fn paste_clipboard_to_frontmost_app() -> Result<(), AppError> {
+    if !macos_input::accessibility_trusted() {
+        macos_input::prompt_accessibility();
+        return Err(AppError::Output(
+            "自动粘贴需要辅助功能权限：请在 系统设置 > 隐私与安全性 > 辅助功能 中打开“鱼泡语音助手”，然后重新打开应用。文本已写入剪贴板，可手动 Command+V。".to_string(),
+        ));
+    }
+    macos_input::send_command_v().map_err(AppError::Output)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn paste_clipboard_to_frontmost_app() -> Result<(), AppError> {
     run_osascript(
         r#"tell application "System Events" to keystroke "v" using command down"#,
@@ -1305,9 +1380,10 @@ async fn call_deepseek_correction(
     input: &str,
     config: &AppConfig,
 ) -> Result<CorrectionResult, AppError> {
+    let prompt = effective_polish_prompt(config);
     let endpoint = normalize_endpoint(config.deepseek_endpoint.trim());
     if !endpoint.is_empty() {
-        return call_cloud_deepseek_correction(input, &endpoint).await;
+        return call_cloud_deepseek_correction(input, &prompt, &endpoint).await;
     }
 
     let api_key = config.deepseek_api_key.trim();
@@ -1315,7 +1391,6 @@ async fn call_deepseek_correction(
         return Err(AppError::MissingDeepSeekKey);
     }
 
-    let prompt = build_correction_prompt();
     let payload = json!({
         "model": config.deepseek_model.trim(),
         "temperature": 0.1,
@@ -1423,11 +1498,12 @@ async fn call_deepseek_translation(
 
 async fn call_cloud_deepseek_correction(
     input: &str,
+    prompt: &str,
     endpoint: &str,
 ) -> Result<CorrectionResult, AppError> {
     let response = Client::new()
         .post(format!("{endpoint}/polish"))
-        .json(&json!({ "input": input }))
+        .json(&json!({ "input": input, "prompt": prompt }))
         .send()
         .await
         .map_err(|error| AppError::DeepSeekFailed(format!("服务端 DeepSeek 代理不可用：{error}")))?;
@@ -1479,6 +1555,15 @@ async fn call_cloud_deepseek_translation(
         .unwrap_or_default()
         .trim()
         .to_string())
+}
+
+fn effective_polish_prompt(config: &AppConfig) -> String {
+    let custom = config.polish_prompt.trim();
+    if custom.is_empty() {
+        build_correction_prompt()
+    } else {
+        custom.to_string()
+    }
 }
 
 fn build_correction_prompt() -> String {
@@ -1664,6 +1749,10 @@ pub fn run() {
             if let Err(error) = register_record_shortcut(&handle, &config) {
                 eprintln!("record shortcut register failed: {error}");
             }
+            #[cfg(target_os = "macos")]
+            if !macos_input::accessibility_trusted() {
+                macos_input::prompt_accessibility();
+            }
             Ok(())
         })
         .manage(RecorderState::default())
@@ -1680,7 +1769,8 @@ pub fn run() {
             start_funasr_service,
             polish_text,
             translate_text,
-            polish_and_translate
+            polish_and_translate,
+            default_polish_prompt
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
