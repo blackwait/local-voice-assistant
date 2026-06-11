@@ -80,6 +80,8 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
           security set-keychain-settings -t 3600 -u build.keychain
           security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          openssl pkcs12 -in certificate.p12 -clcerts -nokeys -passin "pass:$MACOS_CERTIFICATE_PASSWORD" -out certificate.pem
+          security add-trusted-cert -r trustRoot -p codeSign -k build.keychain certificate.pem
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
           security find-identity -v -p codesigning build.keychain
 
@@ -89,13 +91,14 @@ jobs:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
+          IDENTITIES="$(security find-identity -v -p codesigning build.keychain | grep -E '^[[:space:]]*[0-9]+\\) [A-F0-9]+ \"' || true)"
           if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
-            CERT_INFO="$(security find-identity -v -p codesigning build.keychain | grep "\"$MACOS_SIGNING_IDENTITY\"" | head -n 1 || true)"
+            CERT_INFO="$(echo "$IDENTITIES" | grep "\"$MACOS_SIGNING_IDENTITY\"" | head -n 1 || true)"
           else
-            CERT_INFO="$(security find-identity -v -p codesigning build.keychain | grep '"Local Voice Assistant Self Signed"' | head -n 1 || true)"
+            CERT_INFO="$(echo "$IDENTITIES" | grep '"Local Voice Assistant Self Signed"' | head -n 1 || true)"
           fi
           if [ -z "$CERT_INFO" ]; then
-            CERT_INFO="$(security find-identity -v -p codesigning build.keychain | head -n 1 || true)"
+            CERT_INFO="$(echo "$IDENTITIES" | head -n 1 || true)"
           fi
           if [ -z "$CERT_INFO" ]; then
             echo "No code signing identity found. Generate a self-signed .p12 with scripts/create_macos_internal_signing_secret.sh and save it to MACOS_CERTIFICATE." >&2
