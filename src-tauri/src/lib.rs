@@ -583,6 +583,7 @@ mod macos_input {
     use core_foundation::string::{CFString, CFStringRef};
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
 
@@ -590,6 +591,7 @@ mod macos_input {
     const KEY_CODE_V: u16 = 0x09;
     // kVK_Command，用于按下左 Command 修饰键。
     const KEY_CODE_COMMAND: u16 = 0x37;
+    static ACCESSIBILITY_PROMPTED: AtomicBool = AtomicBool::new(false);
 
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
@@ -610,6 +612,13 @@ mod macos_input {
             let options = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), value.as_CFType())]);
             AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef())
         }
+    }
+
+    pub fn prompt_accessibility_once() -> bool {
+        if ACCESSIBILITY_PROMPTED.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        prompt_accessibility()
     }
 
     // 进程内直接发送 Command+V，权限归属当前 app 而非子进程 osascript。
@@ -1267,7 +1276,7 @@ fn write_text_to_clipboard(text: &str) -> Result<(), AppError> {
 #[cfg(target_os = "macos")]
 fn paste_clipboard_to_frontmost_app() -> Result<(), AppError> {
     if !macos_input::accessibility_trusted() {
-        macos_input::prompt_accessibility();
+        macos_input::prompt_accessibility_once();
         return Err(AppError::Output(
             "自动粘贴需要辅助功能权限：请在 系统设置 > 隐私与安全性 > 辅助功能 中打开“鱼泡语音助手”，然后重新打开应用。文本已写入剪贴板，可手动 Command+V。".to_string(),
         ));
@@ -1830,7 +1839,7 @@ pub fn run() {
             }
             #[cfg(target_os = "macos")]
             if !macos_input::accessibility_trusted() {
-                macos_input::prompt_accessibility();
+                macos_input::prompt_accessibility_once();
             }
             Ok(())
         })
