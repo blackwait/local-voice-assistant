@@ -66,6 +66,7 @@ jobs:
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
@@ -74,43 +75,25 @@ jobs:
             exit 1
           fi
           KEYCHAIN_PASSWORD="${KEYCHAIN_PASSWORD:-local-voice-assistant-ci-keychain}"
+          SIGNING_IDENTITY="${MACOS_SIGNING_IDENTITY:-Local Voice Assistant Self Signed}"
           echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
           security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
           security set-keychain-settings -t 3600 -u build.keychain
           security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          openssl pkcs12 -in certificate.p12 -clcerts -nokeys -passin "pass:$MACOS_CERTIFICATE_PASSWORD" -out certificate.pem
-          security add-trusted-cert -r trustRoot -p codeSign -k build.keychain certificate.pem
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
-          security find-identity -v -p codesigning build.keychain
-
-      - name: Select internal macOS signing identity
-        if: matrix.platform == 'macos-latest'
-        env:
-          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-        run: |
-          set -euo pipefail
-          IDENTITIES="$(security find-identity -v -p codesigning build.keychain | grep -E '^[[:space:]]*[0-9]+\\) [A-F0-9]+ \"' || true)"
-          if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
-            CERT_INFO="$(echo "$IDENTITIES" | grep "\"$MACOS_SIGNING_IDENTITY\"" | head -n 1 || true)"
-          else
-            CERT_INFO="$(echo "$IDENTITIES" | grep '"Local Voice Assistant Self Signed"' | head -n 1 || true)"
-          fi
-          if [ -z "$CERT_INFO" ]; then
-            CERT_INFO="$(echo "$IDENTITIES" | head -n 1 || true)"
-          fi
-          if [ -z "$CERT_INFO" ]; then
-            echo "No code signing identity found. Generate a self-signed .p12 with scripts/create_macos_internal_signing_secret.sh and save it to MACOS_CERTIFICATE." >&2
-            exit 1
-          fi
-          CERT_ID="$(echo "$CERT_INFO" | awk -F'"' '{print $2}')"
-          echo "APPLE_SIGNING_IDENTITY=$CERT_ID" >> "$GITHUB_ENV"
+          security find-identity -v -p codesigning build.keychain || true
+          echo "internal signing smoke test" > signing-smoke.txt
+          codesign --force --sign "$SIGNING_IDENTITY" signing-smoke.txt
+          codesign --verify --verbose=2 signing-smoke.txt
+          echo "APPLE_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
 
       - name: Build and publish Tauri bundles
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         with:
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
           releaseName: "鱼泡语音助手 ${{ github.event.inputs.tag || github.ref_name }}"
