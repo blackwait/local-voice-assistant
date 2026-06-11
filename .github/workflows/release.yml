@@ -69,7 +69,7 @@ jobs:
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
           releaseName: "鱼泡语音助手 ${{ github.event.inputs.tag || github.ref_name }}"
           releaseBody: "鱼泡语音助手多平台安装包"
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
 
