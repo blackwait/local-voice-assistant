@@ -47,6 +47,11 @@ export interface FunAsrHealthView {
   device: string;
 }
 
+export interface AccessibilityPermissionView {
+  trusted: boolean;
+  platform: string;
+}
+
 export interface VoiceHistoryItem {
   id: string;
   text: string;
@@ -106,6 +111,14 @@ export function translateText(input: string, targetLanguage: string) {
 
 export function outputTextToCursor(text: string) {
   return invoke<void>("output_text_to_cursor", { text });
+}
+
+export function checkAccessibilityPermission() {
+  return invoke<AccessibilityPermissionView>("check_accessibility_permission");
+}
+
+export function openAccessibilitySettings() {
+  return invoke<void>("open_accessibility_settings");
 }
 
 export function copyTextToClipboard(text: string) {

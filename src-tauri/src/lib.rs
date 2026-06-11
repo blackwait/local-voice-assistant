@@ -11,6 +11,8 @@ use std::io::Cursor;
 ))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process;
 use std::process::Command;
 #[cfg(any(
     target_os = "macos",
@@ -168,6 +170,12 @@ struct FunAsrHealthView {
     device: String,
 }
 
+#[derive(Debug, Serialize)]
+struct AccessibilityPermissionView {
+    trusted: bool,
+    platform: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VoiceHistoryItem {
     id: String,
@@ -193,6 +201,8 @@ struct DeepSeekResponse {
 #[derive(Default)]
 struct RecorderState {
     controller: Mutex<Option<RecordingController>>,
+    #[cfg(target_os = "macos")]
+    target_pid: Mutex<Option<i32>>,
 }
 
 struct RecordingController {
@@ -229,6 +239,19 @@ fn save_config(app: AppHandle, mut config: AppConfig) -> Result<AppConfigView, S
 #[tauri::command]
 fn output_text_to_cursor(app: AppHandle, text: String) -> Result<(), String> {
     output_text_to_cursor_inner(&app, text).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn check_accessibility_permission() -> AccessibilityPermissionView {
+    AccessibilityPermissionView {
+        trusted: accessibility_permission_trusted(),
+        platform: env::consts::OS.to_string(),
+    }
+}
+
+#[tauri::command]
+fn open_accessibility_settings() -> Result<(), String> {
+    open_accessibility_settings_inner()
 }
 
 #[tauri::command]
@@ -602,9 +625,9 @@ mod macos_microphone_permission {
             ]
         };
 
-        let granted = rx.recv_timeout(Duration::from_secs(60)).map_err(|_| {
-            AppError::Audio("获取录音授权显示失败：等待用户授权超时".to_string())
-        })?;
+        let granted = rx
+            .recv_timeout(Duration::from_secs(60))
+            .map_err(|_| AppError::Audio("获取录音授权显示失败：等待用户授权超时".to_string()))?;
         if granted {
             Ok(())
         } else {
@@ -623,6 +646,8 @@ mod macos_input {
     use core_foundation::string::{CFString, CFStringRef};
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
@@ -639,6 +664,9 @@ mod macos_input {
         fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
         fn AXIsProcessTrusted() -> bool;
     }
+
+    #[link(name = "AppKit", kind = "framework")]
+    extern "C" {}
 
     pub fn accessibility_trusted() -> bool {
         unsafe { AXIsProcessTrusted() }
@@ -659,6 +687,37 @@ mod macos_input {
             return false;
         }
         prompt_accessibility()
+    }
+
+    pub fn frontmost_application_pid() -> Option<i32> {
+        let workspace_class = AnyClass::get(c"NSWorkspace")?;
+        let workspace: *mut AnyObject = unsafe { msg_send![workspace_class, sharedWorkspace] };
+        if workspace.is_null() {
+            return None;
+        }
+        let app: *mut AnyObject = unsafe { msg_send![workspace, frontmostApplication] };
+        if app.is_null() {
+            return None;
+        }
+        let pid: i32 = unsafe { msg_send![app, processIdentifier] };
+        (pid > 0).then_some(pid)
+    }
+
+    pub fn activate_application(pid: i32) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        let app_class = match AnyClass::get(c"NSRunningApplication") {
+            Some(class) => class,
+            None => return false,
+        };
+        let app: *mut AnyObject =
+            unsafe { msg_send![app_class, runningApplicationWithProcessIdentifier: pid] };
+        if app.is_null() {
+            return false;
+        }
+        let activated: Bool = unsafe { msg_send![app, activateWithOptions: 2usize] };
+        activated.as_bool()
     }
 
     // 进程内直接发送 Command+V，权限归属当前 app 而非子进程 osascript。
@@ -1093,6 +1152,7 @@ fn register_record_shortcut(app: &AppHandle, config: &AppConfig) -> Result<(), S
                     return;
                 }
 
+                remember_frontmost_target_app(app);
                 let result = app
                     .try_state::<RecorderState>()
                     .ok_or_else(|| "录音状态未初始化".to_string())
@@ -1120,6 +1180,34 @@ fn register_record_shortcut(app: &AppHandle, config: &AppConfig) -> Result<(), S
         .map_err(|error| format!("Unable to register hotkey: {error}"))
 }
 
+#[cfg(target_os = "macos")]
+fn remember_frontmost_target_app(app: &AppHandle) {
+    let Some(pid) = macos_input::frontmost_application_pid() else {
+        return;
+    };
+    if pid == process::id() as i32 {
+        return;
+    }
+    if let Some(state) = app.try_state::<RecorderState>() {
+        if let Ok(mut target_pid) = state.target_pid.lock() {
+            *target_pid = Some(pid);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn activate_recording_target_app(app: &AppHandle) -> bool {
+    let Some(state) = app.try_state::<RecorderState>() else {
+        return false;
+    };
+    let pid = state
+        .target_pid
+        .lock()
+        .ok()
+        .and_then(|mut target_pid| target_pid.take());
+    pid.is_some_and(macos_input::activate_application)
+}
+
 fn parse_record_shortcut(shortcut: &str) -> Result<Shortcut, String> {
     let shortcut = shortcut.trim();
     if shortcut.is_empty() {
@@ -1132,7 +1220,11 @@ fn parse_record_shortcut(shortcut: &str) -> Result<Shortcut, String> {
 }
 
 fn parse_physical_code_shortcut(shortcut: &str) -> Result<Shortcut, String> {
-    let tokens: Vec<&str> = shortcut.split('+').map(str::trim).filter(|token| !token.is_empty()).collect();
+    let tokens: Vec<&str> = shortcut
+        .split('+')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect();
     let (key_token, modifier_tokens) = tokens
         .split_last()
         .ok_or_else(|| format!("快捷键格式不支持：{shortcut}"))?;
@@ -1159,7 +1251,11 @@ fn parse_physical_code_shortcut(shortcut: &str) -> Result<Shortcut, String> {
             _ => return Err(format!("快捷键格式不支持：{shortcut}")),
         }
     }
-    let modifiers = if modifiers.is_empty() { None } else { Some(modifiers) };
+    let modifiers = if modifiers.is_empty() {
+        None
+    } else {
+        Some(modifiers)
+    };
     Ok(Shortcut::new(modifiers, code))
 }
 
@@ -1323,8 +1419,8 @@ fn write_voice_history(app: &AppHandle, items: &[VoiceHistoryItem]) -> Result<()
     ensure_parent(&path).map_err(AppError::Io)?;
     let mut next_items = items.to_vec();
     normalize_voice_history(&mut next_items);
-    let text =
-        serde_json::to_string_pretty(&next_items).map_err(|error| AppError::Io(error.to_string()))?;
+    let text = serde_json::to_string_pretty(&next_items)
+        .map_err(|error| AppError::Io(error.to_string()))?;
     fs::write(path, text).map_err(|error| AppError::Io(error.to_string()))
 }
 
@@ -1371,6 +1467,12 @@ fn output_text_to_cursor_inner(app: &AppHandle, text: String) -> Result<(), AppE
     if let Some(overlay) = app.get_webview_window(OVERLAY_LABEL) {
         let _ = overlay.hide();
     }
+    #[cfg(target_os = "macos")]
+    {
+        let restored = activate_recording_target_app(app);
+        thread::sleep(Duration::from_millis(if restored { 360 } else { 240 }));
+    }
+    #[cfg(not(target_os = "macos"))]
     thread::sleep(Duration::from_millis(180));
     paste_clipboard_to_frontmost_app()
 }
@@ -1426,10 +1528,39 @@ fn paste_clipboard_to_frontmost_app() -> Result<(), AppError> {
     if !macos_input::accessibility_trusted() {
         macos_input::prompt_accessibility_once();
         return Err(AppError::Output(
-            "自动粘贴需要辅助功能权限：请在 系统设置 > 隐私与安全性 > 辅助功能 中打开“鱼泡语音助手”，然后重新打开应用。文本已写入剪贴板，可手动 Command+V。".to_string(),
+            "自动粘贴需要辅助功能权限：请在系统设置中打开“鱼泡语音助手”。文本已写入剪贴板。"
+                .to_string(),
         ));
     }
     macos_input::send_command_v().map_err(AppError::Output)
+}
+
+#[cfg(target_os = "macos")]
+fn accessibility_permission_trusted() -> bool {
+    macos_input::accessibility_trusted()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn accessibility_permission_trusted() -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn open_accessibility_settings_inner() -> Result<(), String> {
+    let status = Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        .status()
+        .map_err(|error| format!("打开辅助功能设置失败：{error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("打开辅助功能设置失败：{status}"))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_accessibility_settings_inner() -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -1997,6 +2128,8 @@ pub fn run() {
             load_config,
             save_config,
             output_text_to_cursor,
+            check_accessibility_permission,
+            open_accessibility_settings,
             copy_text_to_clipboard,
             record_voice_history,
             list_voice_history,

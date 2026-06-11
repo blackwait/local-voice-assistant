@@ -43,10 +43,12 @@ openssl pkcs12 -export \
   -macalg sha1 >/dev/null 2>&1
 
 base64 <"$OUT_DIR/identity.p12" >"$OUT_DIR/identity.p12.base64"
+CERT_SHA1="$(openssl x509 -in "$OUT_DIR/cert.pem" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
 
 cat <<EOF
 Generated internal signing certificate:
   identity: $IDENTITY
+  sha1:     $CERT_SHA1
   p12:      $OUT_DIR/identity.p12
   base64:   $OUT_DIR/identity.p12.base64
 
@@ -54,6 +56,7 @@ Add these GitHub repository secrets:
   MACOS_CERTIFICATE            = contents of $OUT_DIR/identity.p12.base64
   MACOS_CERTIFICATE_PASSWORD   = $CERT_PASSWORD
   MACOS_SIGNING_IDENTITY       = $IDENTITY
+  MACOS_CERTIFICATE_SHA1       = $CERT_SHA1
 
 Keep using the same certificate for future releases. Re-generating it changes the app identity and macOS may ask for microphone permission again.
 EOF

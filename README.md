@@ -60,9 +60,20 @@ npm run mac:signing-secret
 MACOS_CERTIFICATE
 MACOS_CERTIFICATE_PASSWORD
 MACOS_SIGNING_IDENTITY
+MACOS_CERTIFICATE_SHA1
 ```
 
 同事首次打开未公证应用时，可能仍需要在系统设置中允许打开，或清理隔离属性。
+后续更新必须继续使用同一份证书和同一个 Bundle ID：`com.black.local-voice-assistant`。
+如果 GitHub Actions 检测到签名证书指纹不一致，会拒绝发布 macOS 包，避免用户更新后丢失辅助功能授权。
+
+本地构建脚本不会静默生成新证书。仅本机临时开发时才使用：
+
+```bash
+ALLOW_CREATE_LOCAL_SIGNING_CERT=1 npm run package:mac
+```
+
+正式分发给同事的包必须来自同一条 GitHub Release 构建链路，不要混用本机临时包和 CI 包。
 
 ### 已授权但仍提示辅助功能权限
 

@@ -488,6 +488,39 @@ kbd {
   padding-top: 16px;
 }
 
+.permission-box {
+  margin-top: 14px;
+  border: 1px solid rgba(23, 32, 27, 0.14);
+  border-radius: 8px;
+  padding: 13px;
+  background: rgba(255, 253, 245, 0.64);
+}
+
+.permission-box.ok {
+  border-color: rgba(46, 125, 91, 0.28);
+}
+
+.permission-box.warning {
+  border-color: rgba(182, 61, 41, 0.28);
+  background: rgba(218, 77, 52, 0.08);
+}
+
+.permission-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #4c594f;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.permission-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 12px;
+}
+
 dl {
   margin: 12px 0 0;
 }

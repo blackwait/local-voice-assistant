@@ -15,6 +15,7 @@ import {
   Save,
   Server,
   Settings2,
+  ShieldCheck,
   Sparkles,
   Trash2,
   X
@@ -25,9 +26,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AssistantResult,
   AppConfig,
+  AccessibilityPermissionView,
   VoiceHistoryItem,
   WhisperModelProfile,
   cancelNativeRecording,
+  checkAccessibilityPermission,
   checkFunasrService,
   closeVoiceOverlay,
   clearVoiceHistory,
@@ -36,6 +39,7 @@ import {
   getDefaultPolishPrompt,
   listVoiceHistory,
   loadConfig,
+  openAccessibilitySettings,
   outputTextToCursor,
   polishText,
   recordVoiceHistory,
@@ -140,6 +144,7 @@ function MainApp() {
   const [historyMessage, setHistoryMessage] = useState("");
   const [targetLanguage, setTargetLanguage] = useState("中文");
   const [result, setResult] = useState<AssistantResult>();
+  const [accessibilityStatus, setAccessibilityStatus] = useState<AccessibilityPermissionView>();
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -151,6 +156,7 @@ function MainApp() {
         targetLanguageRef.current = nextConfig.target_language || "中文";
       })
       .catch((err) => setError(toUserFacingError(err)));
+    void refreshAccessibilityStatus();
   }, []);
 
   useEffect(() => {
@@ -321,6 +327,25 @@ function MainApp() {
 
   const progress = useMemo(() => `${Math.min(100, (seconds / MAX_SECONDS) * 100)}%`, [seconds]);
   const busy = PROCESSING_STAGES.includes(stage);
+  const isMacos = accessibilityStatus?.platform === "macos";
+
+  async function refreshAccessibilityStatus() {
+    try {
+      const status = await checkAccessibilityPermission();
+      setAccessibilityStatus(status);
+    } catch {
+      setAccessibilityStatus(undefined);
+    }
+  }
+
+  async function openMacosAccessibilitySettings() {
+    try {
+      await openAccessibilitySettings();
+      await refreshAccessibilityStatus();
+    } catch (err) {
+      setError(toUserFacingError(err));
+    }
+  }
 
   async function startRecording() {
     if (stageRef.current === "recording" || PROCESSING_STAGES.includes(stageRef.current)) {
@@ -549,11 +574,13 @@ function MainApp() {
     await saveHistoryText(finalText);
     try {
       await outputTextToCursor(finalText);
+      void refreshAccessibilityStatus();
       return true;
     } catch (err) {
       const message = toUserFacingError(err);
       const pasteShortcut = manualPasteShortcut();
-      setError(`${message}。文本已尽量写入剪贴板，可手动 ${pasteShortcut} 粘贴。`);
+      void refreshAccessibilityStatus();
+      setError(formatPasteFailureMessage(message, pasteShortcut));
       void showOverlayState("error", "自动粘贴失败", processingSeconds, `已尝试写入剪贴板，可手动 ${pasteShortcut}`, 0.1, {
         transcribeSeconds,
         correctionSeconds,
@@ -930,6 +957,7 @@ function MainApp() {
           <StatusDot ok={Boolean(config?.funasr_endpoint)} label="FunASR 服务" />
           <StatusDot ok={config.asr_engine === "funasr" || Boolean(config?.whisper_model_path)} label={asrEngineName(config)} />
           <StatusDot ok={Boolean(config?.deepseek_key_configured)} label="DeepSeek" />
+          {isMacos ? <StatusDot ok={Boolean(accessibilityStatus?.trusted)} label="辅助功能" /> : null}
         </div>
       </section>
 
@@ -1016,6 +1044,25 @@ function MainApp() {
                 <dd>{config.asr_engine === "funasr" ? config.funasr_endpoint : config?.whisper_cli_path || "未配置"}</dd>
               </dl>
             </div>
+
+            {isMacos ? (
+              <div className={accessibilityStatus?.trusted ? "permission-box ok" : "permission-box warning"}>
+                <div className="permission-title">
+                  <ShieldCheck size={16} />
+                  <span>辅助功能{accessibilityStatus?.trusted ? "已授权" : "未授权"}</span>
+                </div>
+                {!accessibilityStatus?.trusted ? (
+                  <div className="permission-actions">
+                    <button className="primary" onClick={() => void openMacosAccessibilitySettings()}>
+                      打开系统设置
+                    </button>
+                    <button className="icon-button wide" onClick={() => void refreshAccessibilityStatus()}>
+                      重新检测
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
           </aside>
 
           <section className="result-panel">
@@ -1832,6 +1879,17 @@ function toUserFacingError(error: unknown) {
     return "本地 Whisper 模型不可用：应用会优先使用 FunASR；如需离线识别，可在“模型设置”填写有效模型路径。";
   }
   return message;
+}
+
+function formatPasteFailureMessage(message: string, pasteShortcut: string) {
+  const cleanMessage = message
+    .replace(/。?文本已尽量写入剪贴板，可手动.*?粘贴。?$/u, "")
+    .replace(/。?可手动.*?粘贴。?$/u, "")
+    .trim();
+  const suffix = cleanMessage.includes("文本已写入剪贴板")
+    ? `可手动 ${pasteShortcut} 粘贴。`
+    : `文本已尽量写入剪贴板，可手动 ${pasteShortcut} 粘贴。`;
+  return `${cleanMessage.replace(/。$/u, "")}。${suffix}`;
 }
 
 function manualPasteShortcut() {

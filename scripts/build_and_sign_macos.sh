@@ -6,6 +6,7 @@
 #   macOS 的隐私权限(TCC，麦克风/辅助功能)会把授权绑定到“代码签名身份”。
 #   ad-hoc 签名没有稳定身份，每次重新打包 cdhash 都变，导致授权存不住、反复弹框。
 #   用一个固定的自签名证书签名后，授权绑定到证书身份，授权一次即长期有效。
+#   发布包不要临时生成证书；证书缺失时应直接失败，避免用户更新后权限失效。
 #
 # 用法：
 #   bash scripts/build_and_sign_macos.sh            # 默认 debug 构建（更快）
@@ -15,18 +16,32 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-IDENTITY="Local Voice Assistant Self Signed"
+IDENTITY="${MACOS_SIGNING_IDENTITY:-Local Voice Assistant Self Signed}"
 APP_NAME="鱼泡语音助手.app"
 KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 BUILD_PROFILE="${BUILD_PROFILE:-debug}"
 CERT_PASS="voiceassistant"
+ALLOW_CREATE_LOCAL_SIGNING_CERT="${ALLOW_CREATE_LOCAL_SIGNING_CERT:-0}"
 
 ensure_identity() {
   if security find-certificate -c "$IDENTITY" "$KEYCHAIN" >/dev/null 2>&1; then
     echo "✓ 签名证书已存在：$IDENTITY"
     return
   fi
-  echo "→ 首次运行，创建自签名代码签名证书：$IDENTITY"
+  if [ "$ALLOW_CREATE_LOCAL_SIGNING_CERT" != "1" ]; then
+    cat >&2 <<EOF
+✗ 未找到签名证书：$IDENTITY
+
+为避免 macOS 把每次更新识别成不同应用，本脚本不会自动创建新证书。
+
+处理方式：
+  1. 发布包：导入同一份 .p12 证书后再构建。
+  2. 仅本机临时开发：ALLOW_CREATE_LOCAL_SIGNING_CERT=1 bash scripts/build_and_sign_macos.sh
+
+EOF
+    exit 1
+  fi
+  echo "→ 首次运行，创建本机临时自签名代码签名证书：$IDENTITY"
   local tmp
   tmp="$(mktemp -d)"
   cat >"$tmp/cert.conf" <<EOF

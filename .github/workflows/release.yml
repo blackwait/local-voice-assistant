@@ -67,15 +67,16 @@ jobs:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          MACOS_CERTIFICATE_SHA1: ${{ secrets.MACOS_CERTIFICATE_SHA1 }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
-          if [ -z "${MACOS_CERTIFICATE:-}" ] || [ -z "${MACOS_CERTIFICATE_PASSWORD:-}" ]; then
-            echo "MACOS_CERTIFICATE and MACOS_CERTIFICATE_PASSWORD secrets are required for internal macOS release signing." >&2
+          if [ -z "${MACOS_CERTIFICATE:-}" ] || [ -z "${MACOS_CERTIFICATE_PASSWORD:-}" ] || [ -z "${MACOS_SIGNING_IDENTITY:-}" ]; then
+            echo "MACOS_CERTIFICATE, MACOS_CERTIFICATE_PASSWORD and MACOS_SIGNING_IDENTITY secrets are required for macOS release signing." >&2
             exit 1
           fi
           KEYCHAIN_PASSWORD="${KEYCHAIN_PASSWORD:-local-voice-assistant-ci-keychain}"
-          SIGNING_IDENTITY="${MACOS_SIGNING_IDENTITY:-Local Voice Assistant Self Signed}"
+          SIGNING_IDENTITY="$MACOS_SIGNING_IDENTITY"
           echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
           security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
           security default-keychain -s build.keychain
@@ -84,16 +85,25 @@ jobs:
           security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
           security find-identity -v -p codesigning build.keychain || true
+          CERT_SHA1="$(security find-certificate -c "$SIGNING_IDENTITY" -Z build.keychain | awk '/SHA-1 hash:/{print tolower($3); exit}')"
+          if [ -z "$CERT_SHA1" ]; then
+            echo "Unable to read SHA-1 fingerprint for signing identity: $SIGNING_IDENTITY" >&2
+            exit 1
+          fi
+          if [ -n "${MACOS_CERTIFICATE_SHA1:-}" ] && [ "$CERT_SHA1" != "$(echo "$MACOS_CERTIFICATE_SHA1" | tr '[:upper:]' '[:lower:]')" ]; then
+            echo "Signing certificate fingerprint mismatch. Refusing to publish a package that would lose macOS privacy permissions." >&2
+            exit 1
+          fi
           echo "internal signing smoke test" > signing-smoke.txt
           codesign --force --sign "$SIGNING_IDENTITY" signing-smoke.txt
           codesign --verify --verbose=2 signing-smoke.txt
           echo "APPLE_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          echo "EXPECTED_SIGNING_CERT_SHA1=$CERT_SHA1" >> "$GITHUB_ENV"
 
       - name: Build and publish Tauri bundles
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         with:
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
           releaseName: "鱼泡语音助手 ${{ github.event.inputs.tag || github.ref_name }}"
@@ -101,6 +111,25 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Verify macOS app signing identity
+        if: matrix.platform == 'macos-latest'
+        run: |
+          set -euo pipefail
+          APPS_FILE="$(mktemp)"
+          find src-tauri/target -type d -name "*.app" -path "*/bundle/macos/*" > "$APPS_FILE"
+          if [ ! -s "$APPS_FILE" ]; then
+            echo "No macOS .app bundle found after build." >&2
+            exit 1
+          fi
+          while IFS= read -r APP; do
+            echo "Verifying $APP"
+            codesign --verify --deep --strict "$APP"
+            codesign -dv --verbose=2 "$APP" 2>&1 | grep -E "Authority|Identifier|TeamIdentifier" || true
+            REQUIREMENT="$(codesign -dr - "$APP" 2>&1)"
+            echo "$REQUIREMENT"
+            echo "$REQUIREMENT" | grep -q "certificate leaf = H\"$EXPECTED_SIGNING_CERT_SHA1\""
+          done < "$APPS_FILE"
 
   rename-assets:
     needs: build
