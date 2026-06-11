@@ -108,7 +108,6 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
         with:
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
           releaseName: "鱼泡语音助手 ${{ github.event.inputs.tag || github.ref_name }}"
