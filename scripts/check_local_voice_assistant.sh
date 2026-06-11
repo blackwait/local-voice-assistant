@@ -26,10 +26,10 @@ print_status() {
   printf '%-18s %s\n' "$1" "$2"
 }
 
-ASR_ENGINE="$(json_value asr_engine whisper)"
+ASR_ENGINE="$(json_value asr_engine funasr)"
 WHISPER_MODEL="$(json_value whisper_model_path '')"
 WHISPER_CLI="$(json_value whisper_cli_path whisper-cli)"
-FUNASR_ENDPOINT="$(json_value funasr_endpoint http://127.0.0.1:10095)"
+FUNASR_ENDPOINT="$(json_value funasr_endpoint http://10.254.81.32:10095)"
 FUNASR_MODEL="$(json_value funasr_model iic/SenseVoiceSmall)"
 FUNASR_DEVICE="$(json_value funasr_device cpu)"
 

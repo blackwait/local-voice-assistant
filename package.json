@@ -1,6 +1,6 @@
 {
   "name": "local-voice-assistant",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "private": true,
   "type": "module",
   "scripts": {
@@ -13,7 +13,8 @@
     "funasr:check": "scripts/check_funasr_service.sh",
     "build": "tsc && vite build",
     "tauri:build": "tauri build",
-    "package:mac": "scripts/build_and_sign_macos.sh"
+    "package:mac": "scripts/build_and_sign_macos.sh",
+    "mac:signing-secret": "scripts/create_macos_internal_signing_secret.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

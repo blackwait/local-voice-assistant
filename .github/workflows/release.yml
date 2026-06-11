@@ -21,7 +21,7 @@ jobs:
       matrix:
         include:
           - platform: macos-latest
-            args: --target universal-apple-darwin --no-sign
+            args: --target universal-apple-darwin
           - platform: ubuntu-22.04
             args: ""
           - platform: windows-latest
@@ -61,19 +61,54 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Cache Whisper tiny model
-        uses: actions/cache@v4
-        with:
-          path: models/ggml-tiny.bin
-          key: ${{ runner.os }}-whisper-tiny-v1
+      - name: Import internal macOS signing certificate
+        if: matrix.platform == 'macos-latest'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MACOS_CERTIFICATE:-}" ] || [ -z "${MACOS_CERTIFICATE_PASSWORD:-}" ]; then
+            echo "MACOS_CERTIFICATE and MACOS_CERTIFICATE_PASSWORD secrets are required for internal macOS release signing." >&2
+            exit 1
+          fi
+          KEYCHAIN_PASSWORD="${KEYCHAIN_PASSWORD:-local-voice-assistant-ci-keychain}"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          security find-identity -v -p codesigning build.keychain
 
-      - name: Download Whisper tiny model
-        run: node scripts/download_whisper_tiny_model.mjs
+      - name: Select internal macOS signing identity
+        if: matrix.platform == 'macos-latest'
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
+            CERT_INFO="$(security find-identity -v -p codesigning build.keychain | grep "\"$MACOS_SIGNING_IDENTITY\"" | head -n 1 || true)"
+          else
+            CERT_INFO="$(security find-identity -v -p codesigning build.keychain | grep '"Local Voice Assistant Self Signed"' | head -n 1 || true)"
+          fi
+          if [ -z "$CERT_INFO" ]; then
+            CERT_INFO="$(security find-identity -v -p codesigning build.keychain | head -n 1 || true)"
+          fi
+          if [ -z "$CERT_INFO" ]; then
+            echo "No code signing identity found. Generate a self-signed .p12 with scripts/create_macos_internal_signing_secret.sh and save it to MACOS_CERTIFICATE." >&2
+            exit 1
+          fi
+          CERT_ID="$(echo "$CERT_INFO" | awk -F'"' '{print $2}')"
+          echo "APPLE_SIGNING_IDENTITY=$CERT_ID" >> "$GITHUB_ENV"
 
       - name: Build and publish Tauri bundles
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
         with:
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
           releaseName: "鱼泡语音助手 ${{ github.event.inputs.tag || github.ref_name }}"

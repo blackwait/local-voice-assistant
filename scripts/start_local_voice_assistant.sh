@@ -36,8 +36,8 @@ wait_for_funasr() {
 
 cd "$ROOT_DIR"
 
-ASR_ENGINE="$(json_value asr_engine whisper)"
-FUNASR_ENDPOINT="$(json_value funasr_endpoint http://127.0.0.1:10095)"
+ASR_ENGINE="$(json_value asr_engine funasr)"
+FUNASR_ENDPOINT="$(json_value funasr_endpoint http://10.254.81.32:10095)"
 
 if [ "$ASR_ENGINE" = "funasr" ]; then
   FUNASR_MODEL="$(json_value funasr_model iic/SenseVoiceSmall)"

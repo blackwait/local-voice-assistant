@@ -52,17 +52,10 @@ const OVERLAY_STATE_EVENT = "voice-overlay-state";
 const OVERLAY_CANCEL_EVENT = "voice-overlay-cancel";
 const RECORD_SHORTCUT_EVENT = "record-shortcut-pressed";
 const RECORD_TRANSCRIBED_EVENT = "record-transcribed";
-const DEFAULT_WHISPER_MODEL_PATH = "models/ggml-tiny.bin";
 const DEFAULT_CONFIG: AppConfig = {
   whisper_cli_path: "/usr/local/bin/whisper-cli",
-  whisper_model_path: DEFAULT_WHISPER_MODEL_PATH,
-  whisper_model_profiles: [
-    {
-      name: "Tiny 内置轻量",
-      path: DEFAULT_WHISPER_MODEL_PATH,
-      speed_hint: "最轻量，适合快速语音输入"
-    }
-  ],
+  whisper_model_path: "",
+  whisper_model_profiles: [],
   whisper_threads: "8",
   asr_engine: "funasr",
   funasr_endpoint: "http://10.254.81.32:10095",
@@ -773,7 +766,7 @@ function MainApp() {
           <h1>鱼泡语音助手</h1>
         </div>
         <div className="status-strip">
-          <StatusDot ok={Boolean(config?.whisper_model_path)} label="本地模型" />
+          <StatusDot ok={Boolean(config?.funasr_endpoint)} label="FunASR 服务" />
           <StatusDot ok={config.asr_engine === "funasr" || Boolean(config?.whisper_model_path)} label={asrEngineName(config)} />
           <StatusDot ok={Boolean(config?.deepseek_key_configured)} label="DeepSeek" />
         </div>
@@ -851,14 +844,14 @@ function MainApp() {
                 当前配置
               </div>
               <dl>
-                <dt>模型文件</dt>
+                <dt>{config.asr_engine === "funasr" ? "FunASR 模型" : "模型文件"}</dt>
                 <dd>{config.asr_engine === "funasr" ? config.funasr_model : config?.whisper_model_path || "未配置"}</dd>
                 <dt>识别引擎</dt>
                 <dd>{asrEngineName(config)}</dd>
                 <dt>DeepSeek 模型</dt>
                 <dd>{config?.deepseek_model ?? "检测中"}</dd>
-                <dt>Whisper CLI</dt>
-                <dd>{config?.whisper_cli_path || "未配置"}</dd>
+                <dt>{config.asr_engine === "funasr" ? "服务地址" : "Whisper CLI"}</dt>
+                <dd>{config.asr_engine === "funasr" ? config.funasr_endpoint : config?.whisper_cli_path || "未配置"}</dd>
               </dl>
             </div>
           </aside>
@@ -905,8 +898,8 @@ function MainApp() {
       ) : null}
 
       {activeSection === "model" ? (
-        <SettingsPanel title="模型设置" subtitle="配置语音识别引擎，不需要再手写 .env.local">
-          <SettingRow title="识别引擎" desc="Whisper 走本地 whisper.cpp；FunASR 走 HTTP 服务">
+        <SettingsPanel title="模型设置" subtitle="默认使用 FunASR 服务；本地 Whisper 仅在自行部署后配置">
+          <SettingRow title="识别引擎" desc="FunASR 走 HTTP 服务；Whisper 需要自行安装 whisper.cpp 和 ggml 模型">
             <select value={config.asr_engine} onChange={(event) => updateConfig({ asr_engine: event.target.value })}>
               <option value="whisper">Whisper 本地模型</option>
               <option value="funasr">FunASR / SenseVoice</option>
@@ -915,7 +908,7 @@ function MainApp() {
 
           {config.asr_engine === "funasr" ? (
             <>
-              <SettingRow title="FunASR 服务" desc="本机地址可启动服务；云端地址直接检测服务">
+              <SettingRow title="FunASR 服务" desc="默认使用当前服务模型；云端地址直接检测服务">
                 <div className="service-actions">
                   <button className="primary" disabled={funasrBusy} onClick={() => void startFunasr()}>
                     {funasrBusy ? <Loader2 size={16} className="spin" /> : <Server size={16} />}
@@ -926,7 +919,7 @@ function MainApp() {
                   </button>
                 </div>
               </SettingRow>
-              <SettingRow title="服务地址" desc="默认本机 10095；也可填写云端 10095 地址">
+              <SettingRow title="服务地址" desc="默认使用当前 10095 服务；也可填写其他 FunASR 服务地址">
                 <input value={config.funasr_endpoint} onChange={(event) => updateConfig({ funasr_endpoint: event.target.value })} />
               </SettingRow>
               <SettingRow title="FunASR 模型" desc="默认 SenseVoiceSmall；可换成已支持的 ModelScope 模型名或本地路径">
@@ -941,7 +934,7 @@ function MainApp() {
             </>
           ) : null}
 
-          <SettingRow title="当前 Whisper 模型" desc={activeModelProfile(config)?.speed_hint || "选择一个已保存模型，切换后立即保存"}>
+          <SettingRow title="当前 Whisper 模型" desc={activeModelProfile(config)?.speed_hint || "未内置本地模型；需要自行下载并添加 ggml 模型路径"}>
             <select value={config.whisper_model_path} onChange={(event) => void selectModel(event.target.value)}>
               {config.whisper_model_profiles.map((profile) => (
                 <option key={profile.path} value={profile.path}>
@@ -951,7 +944,7 @@ function MainApp() {
               {!config.whisper_model_profiles.length ? <option value="">未配置模型</option> : null}
             </select>
           </SettingRow>
-          <SettingRow title="模型档案" desc="Base 更快，Large 更准；可以保留多个模型随时切换">
+          <SettingRow title="模型档案" desc="仅保存你手动添加的本地模型；安装包不自带 Whisper 模型">
             <div className="model-profile-list">
               {config.whisper_model_profiles.map((profile) => (
                 <button
@@ -966,7 +959,7 @@ function MainApp() {
               ))}
             </div>
           </SettingRow>
-          <SettingRow title="新增模型" desc="填写 ggml 模型文件完整路径，保存后会加入档案并切换过去">
+          <SettingRow title="新增模型" desc="填写你自行部署的 ggml 模型文件完整路径，保存后会加入档案并切换过去">
             <div className="model-add-form">
               <input value={modelNameDraft} onChange={(event) => setModelNameDraft(event.target.value)} placeholder="模型名称，例如 Tiny 快速" />
               <input value={modelPathDraft} onChange={(event) => setModelPathDraft(event.target.value)} placeholder="/path/to/ggml-base.bin" />

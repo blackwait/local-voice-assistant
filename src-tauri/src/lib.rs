@@ -31,9 +31,9 @@ const RECORD_SHORTCUT_EVENT: &str = "record-shortcut-pressed";
 const RECORD_TRANSCRIBED_EVENT: &str = "record-transcribed";
 const OVERLAY_LABEL: &str = "voice-overlay";
 const OVERLAY_STATE_EVENT: &str = "voice-overlay-state";
-const BUNDLED_WHISPER_MODEL_RELATIVE_PATH: &str = "models/ggml-tiny.bin";
 const LEGACY_VOICE_TRANSCRIBER_MODEL_DIR: &str =
     "/Users/black/IdeaProjects/voice-transcriber-tauri/models/";
+const RECORDING_STARTUP_TIMEOUT_SECONDS: u64 = 15;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -97,10 +97,9 @@ impl Default for WhisperModelProfile {
 impl Default for AppConfig {
     fn default() -> Self {
         load_dotenv();
-        let whisper_model_path = default_whisper_model_path();
         Self {
             whisper_cli_path: whisper_cli_path_from_env(),
-            whisper_model_path,
+            whisper_model_path: default_whisper_model_path(),
             whisper_model_profiles: default_model_profiles(),
             whisper_threads: env::var("WHISPER_THREADS").unwrap_or_else(|_| "8".to_string()),
             asr_engine: env::var("ASR_ENGINE").unwrap_or_else(|_| "funasr".to_string()),
@@ -346,6 +345,8 @@ async fn translate_text(
 }
 
 fn start_recording(app: AppHandle, state: &RecorderState) -> Result<(), AppError> {
+    ensure_microphone_permission()?;
+
     let mut current_controller = state
         .controller
         .lock()
@@ -359,7 +360,7 @@ fn start_recording(app: AppHandle, state: &RecorderState) -> Result<(), AppError
     let (result_tx, result_rx) = mpsc::channel::<Result<Vec<u8>, String>>();
     let handle = thread::spawn(move || run_recording_thread(app, command_rx, init_tx, result_tx));
     match init_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(RECORDING_STARTUP_TIMEOUT_SECONDS))
         .map_err(|_| AppError::Audio("麦克风启动超时".to_string()))?
     {
         Ok(()) => {
@@ -561,9 +562,9 @@ mod macos_microphone_permission {
             ]
         };
 
-        let granted = rx
-            .recv_timeout(Duration::from_secs(30))
-            .map_err(|_| AppError::Audio("获取录音授权显示失败：等待用户授权超时".to_string()))?;
+        let granted = rx.recv_timeout(Duration::from_secs(60)).map_err(|_| {
+            AppError::Audio("获取录音授权显示失败：等待用户授权超时".to_string())
+        })?;
         if granted {
             Ok(())
         } else {
@@ -955,7 +956,7 @@ fn load_or_create_config(app: &AppHandle) -> Result<AppConfig, String> {
     Ok(config)
 }
 
-fn normalize_config(app: &AppHandle, config: &mut AppConfig) {
+fn normalize_config(_app: &AppHandle, config: &mut AppConfig) {
     if config.asr_engine.trim().is_empty() {
         config.asr_engine = "funasr".to_string();
     }
@@ -983,26 +984,16 @@ fn normalize_config(app: &AppHandle, config: &mut AppConfig) {
     config
         .whisper_model_profiles
         .retain(|profile| !is_legacy_voice_transcriber_model_path(profile.path.trim()));
-    let default_model_path = default_whisper_model_path_for_app(app);
-    let default_profiles = default_model_profiles_for_app(app);
-    if config.whisper_model_profiles.is_empty() {
-        config.whisper_model_profiles = default_profiles.clone();
+    if is_legacy_voice_transcriber_model_path(config.whisper_model_path.trim()) {
+        config.whisper_model_path.clear();
     }
-    if !config
-        .whisper_model_profiles
-        .iter()
-        .any(|profile| profile.path.trim() == default_model_path)
+    if !config.whisper_model_path.trim().is_empty()
+        && !Path::new(config.whisper_model_path.trim()).is_file()
     {
-        config.whisper_model_profiles.extend(default_profiles);
-    }
-    if config.whisper_model_path.trim().is_empty()
-        || is_legacy_voice_transcriber_model_path(config.whisper_model_path.trim())
-    {
-        config.whisper_model_path = default_model_path;
-    }
-    if !Path::new(config.whisper_model_path.trim()).is_file() {
         if let Some(profile) = first_existing_model_profile(&config.whisper_model_profiles) {
             config.whisper_model_path = profile.path.clone();
+        } else {
+            config.whisper_model_path.clear();
         }
     }
     upsert_current_model_profile(config);
@@ -1786,61 +1777,19 @@ fn default_translation_enabled() -> bool {
 }
 
 fn default_whisper_model_path() -> String {
-    env::var("WHISPER_MODEL_PATH").unwrap_or_else(|_| {
-        local_project_whisper_model_path()
-            .to_string_lossy()
-            .to_string()
-    })
+    env::var("WHISPER_MODEL_PATH").unwrap_or_default()
 }
 
 fn default_model_profiles() -> Vec<WhisperModelProfile> {
-    vec![default_tiny_model_profile(default_whisper_model_path())]
-}
-
-fn default_whisper_model_path_for_app(app: &AppHandle) -> String {
-    env::var("WHISPER_MODEL_PATH").unwrap_or_else(|_| {
-        bundled_whisper_model_path(app)
-            .or_else(|| {
-                let path = local_project_whisper_model_path();
-                path.is_file().then(|| path.to_string_lossy().to_string())
-            })
-            .unwrap_or_else(|| {
-                local_project_whisper_model_path()
-                    .to_string_lossy()
-                    .to_string()
-            })
-    })
-}
-
-fn default_model_profiles_for_app(app: &AppHandle) -> Vec<WhisperModelProfile> {
-    vec![default_tiny_model_profile(
-        default_whisper_model_path_for_app(app),
-    )]
-}
-
-fn default_tiny_model_profile(path: String) -> WhisperModelProfile {
-    WhisperModelProfile {
-        name: "Tiny 内置轻量".to_string(),
-        path,
-        speed_hint: "最轻量，适合快速语音输入".to_string(),
+    let path = default_whisper_model_path();
+    if path.trim().is_empty() {
+        return Vec::new();
     }
-}
-
-fn bundled_whisper_model_path(app: &AppHandle) -> Option<String> {
-    app.path()
-        .resolve(
-            BUNDLED_WHISPER_MODEL_RELATIVE_PATH,
-            tauri::path::BaseDirectory::Resource,
-        )
-        .ok()
-        .filter(|path| path.is_file())
-        .map(|path| path.to_string_lossy().to_string())
-}
-
-fn local_project_whisper_model_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join(BUNDLED_WHISPER_MODEL_RELATIVE_PATH)
+    vec![WhisperModelProfile {
+        name: model_name_from_path(&path),
+        path,
+        speed_hint: "用户配置".to_string(),
+    }]
 }
 
 fn model_name_from_path(path: &str) -> String {
