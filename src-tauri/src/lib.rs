@@ -175,14 +175,12 @@ struct DeepSeekResponse {
 #[derive(Default)]
 struct RecorderState {
     controller: Mutex<Option<RecordingController>>,
-    last_frontmost_app_name: Mutex<Option<String>>,
 }
 
 struct RecordingController {
     command_tx: mpsc::Sender<RecorderCommand>,
     result_rx: mpsc::Receiver<Result<Vec<u8>, String>>,
     handle: thread::JoinHandle<()>,
-    frontmost_app_name: Option<String>,
 }
 
 enum RecorderCommand {
@@ -211,12 +209,8 @@ fn save_config(app: AppHandle, mut config: AppConfig) -> Result<AppConfigView, S
 }
 
 #[tauri::command]
-fn output_text_to_cursor(
-    app: AppHandle,
-    state: tauri::State<RecorderState>,
-    text: String,
-) -> Result<(), String> {
-    output_text_to_cursor_inner(&app, &state, text).map_err(|error| error.to_string())
+fn output_text_to_cursor(app: AppHandle, text: String) -> Result<(), String> {
+    output_text_to_cursor_inner(&app, text).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -343,7 +337,6 @@ fn start_recording(app: AppHandle, state: &RecorderState) -> Result<(), AppError
     let (command_tx, command_rx) = mpsc::channel::<RecorderCommand>();
     let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
     let (result_tx, result_rx) = mpsc::channel::<Result<Vec<u8>, String>>();
-    let frontmost_app_name = current_frontmost_app_name().ok();
     let handle = thread::spawn(move || run_recording_thread(app, command_rx, init_tx, result_tx));
     match init_rx
         .recv_timeout(Duration::from_secs(5))
@@ -354,7 +347,6 @@ fn start_recording(app: AppHandle, state: &RecorderState) -> Result<(), AppError
                 command_tx,
                 result_rx,
                 handle,
-                frontmost_app_name,
             });
             Ok(())
         }
@@ -367,7 +359,6 @@ fn start_recording(app: AppHandle, state: &RecorderState) -> Result<(), AppError
 
 fn stop_recording(state: &RecorderState) -> Result<Vec<u8>, AppError> {
     let controller = take_controller(state)?;
-    save_last_frontmost_app_name(state, controller.frontmost_app_name.clone())?;
     controller
         .command_tx
         .send(RecorderCommand::Stop)
@@ -383,21 +374,8 @@ fn stop_recording(state: &RecorderState) -> Result<Vec<u8>, AppError> {
 
 fn cancel_recording(state: &RecorderState) -> Result<(), AppError> {
     let controller = take_controller(state)?;
-    save_last_frontmost_app_name(state, None)?;
     let _ = controller.command_tx.send(RecorderCommand::Cancel);
     let _ = controller.handle.join();
-    Ok(())
-}
-
-fn save_last_frontmost_app_name(
-    state: &RecorderState,
-    app_name: Option<String>,
-) -> Result<(), AppError> {
-    let mut last_frontmost_app_name = state
-        .last_frontmost_app_name
-        .lock()
-        .map_err(|_| AppError::Audio("前台应用状态锁定失败".to_string()))?;
-    *last_frontmost_app_name = app_name;
     Ok(())
 }
 
@@ -584,9 +562,13 @@ mod macos_input {
     use core_foundation::string::{CFString, CFStringRef};
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use std::thread;
+    use std::time::Duration;
 
     // kVK_ANSI_V，用于模拟 Command+V 粘贴。
     const KEY_CODE_V: u16 = 0x09;
+    // kVK_Command，用于按下左 Command 修饰键。
+    const KEY_CODE_COMMAND: u16 = 0x37;
 
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
@@ -613,15 +595,27 @@ mod macos_input {
     pub fn send_command_v() -> Result<(), String> {
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| "创建键盘事件源失败".to_string())?;
+        let command_down = CGEvent::new_keyboard_event(source.clone(), KEY_CODE_COMMAND, true)
+            .map_err(|_| "创建 Command 按下事件失败".to_string())?;
+        command_down.set_flags(CGEventFlags::CGEventFlagCommand);
+        command_down.post(CGEventTapLocation::HID);
+        thread::sleep(Duration::from_millis(30));
+
         let key_down = CGEvent::new_keyboard_event(source.clone(), KEY_CODE_V, true)
             .map_err(|_| "创建按键事件失败".to_string())?;
         key_down.set_flags(CGEventFlags::CGEventFlagCommand);
         key_down.post(CGEventTapLocation::HID);
+        thread::sleep(Duration::from_millis(30));
 
-        let key_up = CGEvent::new_keyboard_event(source, KEY_CODE_V, false)
+        let key_up = CGEvent::new_keyboard_event(source.clone(), KEY_CODE_V, false)
             .map_err(|_| "创建按键事件失败".to_string())?;
         key_up.set_flags(CGEventFlags::CGEventFlagCommand);
         key_up.post(CGEventTapLocation::HID);
+        thread::sleep(Duration::from_millis(30));
+
+        let command_up = CGEvent::new_keyboard_event(source, KEY_CODE_COMMAND, false)
+            .map_err(|_| "创建 Command 松开事件失败".to_string())?;
+        command_up.post(CGEventTapLocation::HID);
         Ok(())
     }
 }
@@ -1092,11 +1086,7 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data_dir(app)?.join("config.json"))
 }
 
-fn output_text_to_cursor_inner(
-    app: &AppHandle,
-    state: &RecorderState,
-    text: String,
-) -> Result<(), AppError> {
+fn output_text_to_cursor_inner(app: &AppHandle, text: String) -> Result<(), AppError> {
     let text = text.trim();
     if text.is_empty() {
         return Ok(());
@@ -1105,16 +1095,7 @@ fn output_text_to_cursor_inner(
     if let Some(overlay) = app.get_webview_window(OVERLAY_LABEL) {
         let _ = overlay.hide();
     }
-    thread::sleep(Duration::from_millis(120));
-    let app_name = state
-        .last_frontmost_app_name
-        .lock()
-        .map_err(|_| AppError::Output("前台应用状态读取失败".to_string()))?
-        .clone();
-    if let Some(app_name) = app_name.as_deref() {
-        let _ = activate_process(app_name);
-        thread::sleep(Duration::from_millis(120));
-    }
+    thread::sleep(Duration::from_millis(180));
     paste_clipboard_to_frontmost_app()
 }
 
@@ -1137,34 +1118,6 @@ fn write_text_to_clipboard(text: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn current_frontmost_app_name() -> Result<String, AppError> {
-    let output = Command::new("osascript")
-        .args([
-            "-e",
-            r#"tell application "System Events" to get name of first application process whose frontmost is true"#,
-        ])
-        .output()
-        .map_err(|error| AppError::Output(format!("读取当前前台应用失败：{error}")))?;
-    if !output.status.success() {
-        return Err(AppError::Output(
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ));
-    }
-    let app_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if app_name.is_empty() {
-        return Err(AppError::Output("未能识别当前前台应用".to_string()));
-    }
-    Ok(app_name)
-}
-
-fn activate_process(process_name: &str) -> Result<(), AppError> {
-    let script = format!(
-        "tell application \"System Events\" to set frontmost of first process whose name is {:?} to true",
-        process_name
-    );
-    run_osascript(&script, "切回原输入应用失败")
-}
-
 #[cfg(target_os = "macos")]
 fn paste_clipboard_to_frontmost_app() -> Result<(), AppError> {
     if !macos_input::accessibility_trusted() {
@@ -1184,6 +1137,7 @@ fn paste_clipboard_to_frontmost_app() -> Result<(), AppError> {
     )
 }
 
+#[cfg(not(target_os = "macos"))]
 fn run_osascript(script: &str, context: &str) -> Result<(), AppError> {
     let output = Command::new("osascript")
         .args(["-e", script])
