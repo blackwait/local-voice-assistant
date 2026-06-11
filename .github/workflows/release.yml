@@ -72,3 +72,30 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  rename-assets:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Rename release assets to clean ASCII names
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          PREFIX="local-voice-assistant"
+          # 草稿 release 需要从全部 release 列表里按 tag 匹配
+          REL=$(gh api "repos/$REPO/releases" --jq ".[] | select(.tag_name==\"$TAG\")")
+          echo "$REL" | jq -r '.assets[] | "\(.id) \(.name)"' | while read -r ID NAME; do
+            case "$NAME" in
+              _*) NEW="${PREFIX}${NAME}" ;;
+              *)  NEW="$NAME" ;;
+            esac
+            if [ "$NEW" != "$NAME" ]; then
+              gh api -X PATCH "repos/$REPO/releases/assets/$ID" -f name="$NEW" >/dev/null
+              echo "renamed: $NAME -> $NEW"
+            fi
+          done
