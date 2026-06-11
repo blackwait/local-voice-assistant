@@ -650,7 +650,7 @@ mod macos_input {
     use objc2::runtime::{AnyClass, AnyObject, Bool};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     // kVK_ANSI_V，用于模拟 Command+V 粘贴。
     const KEY_CODE_V: u16 = 0x09;
@@ -719,36 +719,56 @@ mod macos_input {
         if app.is_null() {
             return false;
         }
-        let activated: Bool = unsafe { msg_send![app, activateWithOptions: 2usize] };
+        let _: () = unsafe { msg_send![app, unhide] };
+        let activated: Bool = unsafe { msg_send![app, activateWithOptions: 3usize] };
         activated.as_bool()
     }
 
+    pub fn wait_until_frontmost_application(pid: i32, timeout: Duration) -> bool {
+        let started_at = Instant::now();
+        while started_at.elapsed() < timeout {
+            if frontmost_application_pid() == Some(pid) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(40));
+        }
+        false
+    }
+
     // 进程内直接发送 Command+V，权限归属当前 app 而非子进程 osascript。
-    pub fn send_command_v() -> Result<(), String> {
+    pub fn send_command_v(target_pid: Option<i32>) -> Result<(), String> {
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| "创建键盘事件源失败".to_string())?;
         let command_down = CGEvent::new_keyboard_event(source.clone(), KEY_CODE_COMMAND, true)
             .map_err(|_| "创建 Command 按下事件失败".to_string())?;
         command_down.set_flags(CGEventFlags::CGEventFlagCommand);
-        command_down.post(CGEventTapLocation::HID);
+        post_keyboard_event(&command_down, target_pid);
         thread::sleep(Duration::from_millis(30));
 
         let key_down = CGEvent::new_keyboard_event(source.clone(), KEY_CODE_V, true)
             .map_err(|_| "创建按键事件失败".to_string())?;
         key_down.set_flags(CGEventFlags::CGEventFlagCommand);
-        key_down.post(CGEventTapLocation::HID);
+        post_keyboard_event(&key_down, target_pid);
         thread::sleep(Duration::from_millis(30));
 
         let key_up = CGEvent::new_keyboard_event(source.clone(), KEY_CODE_V, false)
             .map_err(|_| "创建按键事件失败".to_string())?;
         key_up.set_flags(CGEventFlags::CGEventFlagCommand);
-        key_up.post(CGEventTapLocation::HID);
+        post_keyboard_event(&key_up, target_pid);
         thread::sleep(Duration::from_millis(30));
 
         let command_up = CGEvent::new_keyboard_event(source, KEY_CODE_COMMAND, false)
             .map_err(|_| "创建 Command 松开事件失败".to_string())?;
-        command_up.post(CGEventTapLocation::HID);
+        post_keyboard_event(&command_up, target_pid);
         Ok(())
+    }
+
+    fn post_keyboard_event(event: &CGEvent, target_pid: Option<i32>) {
+        if let Some(pid) = target_pid {
+            event.post_to_pid(pid);
+        } else {
+            event.post(CGEventTapLocation::HID);
+        }
     }
 }
 
@@ -1200,16 +1220,24 @@ fn remember_frontmost_target_app(app: &AppHandle) {
 }
 
 #[cfg(target_os = "macos")]
-fn activate_recording_target_app(app: &AppHandle) -> bool {
+fn activate_recording_target_app(app: &AppHandle) -> Option<i32> {
     let Some(state) = app.try_state::<RecorderState>() else {
-        return false;
+        return None;
     };
     let pid = state
         .target_pid
         .lock()
         .ok()
         .and_then(|mut target_pid| target_pid.take());
-    pid.is_some_and(macos_input::activate_application)
+    let Some(pid) = pid else {
+        return None;
+    };
+    if macos_input::activate_application(pid) {
+        let _ = macos_input::wait_until_frontmost_application(pid, Duration::from_millis(900));
+        Some(pid)
+    } else {
+        None
+    }
 }
 
 fn parse_record_shortcut(shortcut: &str) -> Result<Shortcut, String> {
@@ -1475,12 +1503,19 @@ fn output_text_to_cursor_inner(app: &AppHandle, text: String) -> Result<(), AppE
     }
     #[cfg(target_os = "macos")]
     {
-        let restored = activate_recording_target_app(app);
-        thread::sleep(Duration::from_millis(if restored { 360 } else { 240 }));
+        let target_pid = activate_recording_target_app(app);
+        thread::sleep(Duration::from_millis(if target_pid.is_some() {
+            180
+        } else {
+            240
+        }));
+        return paste_clipboard_to_frontmost_app(target_pid);
     }
     #[cfg(not(target_os = "macos"))]
-    thread::sleep(Duration::from_millis(180));
-    paste_clipboard_to_frontmost_app()
+    {
+        thread::sleep(Duration::from_millis(180));
+        paste_clipboard_to_frontmost_app()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1530,7 +1565,7 @@ fn write_text_to_clipboard(text: &str) -> Result<(), AppError> {
 }
 
 #[cfg(target_os = "macos")]
-fn paste_clipboard_to_frontmost_app() -> Result<(), AppError> {
+fn paste_clipboard_to_frontmost_app(target_pid: Option<i32>) -> Result<(), AppError> {
     if !macos_input::accessibility_trusted() {
         macos_input::prompt_accessibility_once();
         return Err(AppError::Output(
@@ -1538,7 +1573,7 @@ fn paste_clipboard_to_frontmost_app() -> Result<(), AppError> {
                 .to_string(),
         ));
     }
-    macos_input::send_command_v().map_err(AppError::Output)
+    macos_input::send_command_v(target_pid).map_err(AppError::Output)
 }
 
 #[cfg(target_os = "macos")]
