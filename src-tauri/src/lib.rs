@@ -4,9 +4,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
-use std::io::{Cursor, Write};
+use std::io::Cursor;
+#[cfg(any(
+    target_os = "macos",
+    all(not(target_os = "macos"), not(target_os = "windows"))
+))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(any(
+    target_os = "macos",
+    all(not(target_os = "macos"), not(target_os = "windows"))
+))]
+use std::process::Stdio;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,7 +32,8 @@ const RECORD_TRANSCRIBED_EVENT: &str = "record-transcribed";
 const OVERLAY_LABEL: &str = "voice-overlay";
 const OVERLAY_STATE_EVENT: &str = "voice-overlay-state";
 const BUNDLED_WHISPER_MODEL_RELATIVE_PATH: &str = "models/ggml-tiny.bin";
-const LEGACY_VOICE_TRANSCRIBER_MODEL_DIR: &str = "/Users/black/IdeaProjects/voice-transcriber-tauri/models/";
+const LEGACY_VOICE_TRANSCRIBER_MODEL_DIR: &str =
+    "/Users/black/IdeaProjects/voice-transcriber-tauri/models/";
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -214,7 +225,10 @@ fn output_text_to_cursor(app: AppHandle, text: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn start_native_recording(app: AppHandle, state: tauri::State<RecorderState>) -> Result<(), String> {
+fn start_native_recording(
+    app: AppHandle,
+    state: tauri::State<RecorderState>,
+) -> Result<(), String> {
     start_recording(app, &state).map_err(|error| error.to_string())
 }
 
@@ -253,10 +267,16 @@ fn start_funasr_service(app: AppHandle) -> Result<String, String> {
     let config = load_or_create_config(&app)?;
     let mut script_path = app
         .path()
-        .resolve("scripts/start_funasr_service.sh", tauri::path::BaseDirectory::Resource)
-        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/start_funasr_service.sh"));
+        .resolve(
+            "scripts/start_funasr_service.sh",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/start_funasr_service.sh")
+        });
     if !script_path.is_file() {
-        script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/start_funasr_service.sh");
+        script_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/start_funasr_service.sh");
     }
     if !script_path.is_file() {
         return Err(format!("FunASR 启动脚本不存在：{}", script_path.display()));
@@ -418,8 +438,9 @@ fn run_recording_thread(
     }
 }
 
-fn setup_recording_stream(app: AppHandle) -> Result<(cpal::Stream, Arc<Mutex<Vec<f32>>>, u32, Instant), AppError>
-{
+fn setup_recording_stream(
+    app: AppHandle,
+) -> Result<(cpal::Stream, Arc<Mutex<Vec<f32>>>, u32, Instant), AppError> {
     ensure_microphone_permission()?;
 
     let host = cpal::default_host();
@@ -488,8 +509,8 @@ fn ensure_microphone_permission() -> Result<(), AppError> {
 mod macos_microphone_permission {
     use super::AppError;
     use block2::{DynBlock, RcBlock};
-    use objc2::runtime::{AnyClass, Bool};
     use objc2::msg_send;
+    use objc2::runtime::{AnyClass, Bool};
     use objc2_foundation::NSString;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -509,9 +530,8 @@ mod macos_microphone_permission {
             AppError::Audio("获取录音授权显示失败：AVFoundation 不可用".to_string())
         })?;
         let media_type = unsafe { AVMediaTypeAudio };
-        let status: isize = unsafe {
-            msg_send![device_class, authorizationStatusForMediaType: media_type]
-        };
+        let status: isize =
+            unsafe { msg_send![device_class, authorizationStatusForMediaType: media_type] };
 
         match status {
             AV_AUTHORIZATION_STATUS_AUTHORIZED => Ok(()),
@@ -541,9 +561,9 @@ mod macos_microphone_permission {
             ]
         };
 
-        let granted = rx.recv_timeout(Duration::from_secs(30)).map_err(|_| {
-            AppError::Audio("获取录音授权显示失败：等待用户授权超时".to_string())
-        })?;
+        let granted = rx
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| AppError::Audio("获取录音授权显示失败：等待用户授权超时".to_string()))?;
         if granted {
             Ok(())
         } else {
@@ -617,6 +637,108 @@ mod macos_input {
             .map_err(|_| "创建 Command 松开事件失败".to_string())?;
         command_up.post(CGEventTapLocation::HID);
         Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows_input {
+    use std::mem::size_of;
+    use std::ptr;
+    use std::thread;
+    use std::time::Duration;
+    use windows_sys::Win32::Foundation::GlobalFree;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL, VK_V,
+    };
+
+    const CF_UNICODETEXT: u32 = 13;
+
+    pub fn write_clipboard_text(text: &str) -> Result<(), String> {
+        let mut utf16: Vec<u16> = text.encode_utf16().collect();
+        utf16.push(0);
+        let byte_len = utf16.len() * size_of::<u16>();
+
+        unsafe {
+            if OpenClipboard(ptr::null_mut()) == 0 {
+                return Err("打开剪贴板失败".to_string());
+            }
+
+            let result = write_open_clipboard(&utf16, byte_len);
+            CloseClipboard();
+            result
+        }
+    }
+
+    unsafe fn write_open_clipboard(utf16: &[u16], byte_len: usize) -> Result<(), String> {
+        if EmptyClipboard() == 0 {
+            return Err("清空剪贴板失败".to_string());
+        }
+
+        let memory = GlobalAlloc(GMEM_MOVEABLE, byte_len);
+        if memory.is_null() {
+            return Err("分配剪贴板内存失败".to_string());
+        }
+
+        let locked = GlobalLock(memory) as *mut u16;
+        if locked.is_null() {
+            GlobalFree(memory);
+            return Err("锁定剪贴板内存失败".to_string());
+        }
+
+        ptr::copy_nonoverlapping(utf16.as_ptr(), locked, utf16.len());
+        GlobalUnlock(memory);
+
+        if SetClipboardData(CF_UNICODETEXT, memory).is_null() {
+            GlobalFree(memory);
+            return Err("设置剪贴板数据失败".to_string());
+        }
+
+        Ok(())
+    }
+
+    pub fn send_ctrl_v() -> Result<(), String> {
+        let inputs = [
+            keyboard_input(VK_CONTROL, false),
+            keyboard_input(VK_V, false),
+            keyboard_input(VK_V, true),
+            keyboard_input(VK_CONTROL, true),
+        ];
+        let sent = unsafe {
+            SendInput(
+                inputs.len() as u32,
+                inputs.as_ptr(),
+                size_of::<INPUT>() as i32,
+            )
+        };
+        if sent != inputs.len() as u32 {
+            return Err(format!(
+                "发送 Ctrl+V 失败：已发送 {sent}/{} 个键盘事件",
+                inputs.len()
+            ));
+        }
+        thread::sleep(Duration::from_millis(30));
+        Ok(())
+    }
+
+    fn keyboard_input(key: u16, key_up: bool) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: key,
+                    wScan: 0,
+                    dwFlags: if key_up { KEYEVENTF_KEYUP } else { 0 },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
     }
 }
 
@@ -717,7 +839,12 @@ fn build_u16_input_stream(
         .map_err(|error| AppError::Audio(error.to_string()))
 }
 
-fn push_samples<I>(data: I, channels: usize, max_samples: usize, samples: &Arc<Mutex<Vec<f32>>>) -> f64
+fn push_samples<I>(
+    data: I,
+    channels: usize,
+    max_samples: usize,
+    samples: &Arc<Mutex<Vec<f32>>>,
+) -> f64
 where
     I: Iterator<Item = f32>,
 {
@@ -741,12 +868,7 @@ where
     ((sum / count as f64).sqrt() * 4.5).clamp(0.0, 1.0)
 }
 
-fn emit_recording_level(
-    app: &AppHandle,
-    started_at: Instant,
-    last_emit: &mut Instant,
-    level: f64,
-) {
+fn emit_recording_level(app: &AppHandle, started_at: Instant, last_emit: &mut Instant, level: f64) {
     if last_emit.elapsed() < Duration::from_millis(120) {
         return;
     }
@@ -1014,7 +1136,13 @@ fn transcribe_recording_from_hotkey(app: AppHandle) {
 
 fn is_recording(app: &AppHandle) -> bool {
     app.try_state::<RecorderState>()
-        .and_then(|state| state.controller.lock().ok().map(|controller| controller.is_some()))
+        .and_then(|state| {
+            state
+                .controller
+                .lock()
+                .ok()
+                .map(|controller| controller.is_some())
+        })
         .unwrap_or(false)
 }
 
@@ -1099,6 +1227,33 @@ fn output_text_to_cursor_inner(app: &AppHandle, text: String) -> Result<(), AppE
     paste_clipboard_to_frontmost_app()
 }
 
+#[cfg(target_os = "macos")]
+fn write_text_to_clipboard(text: &str) -> Result<(), AppError> {
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|error| AppError::Output(format!("写入剪贴板失败：{error}")))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|error| AppError::Output(format!("写入剪贴板失败：{error}")))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|error| AppError::Output(format!("等待剪贴板写入失败：{error}")))?;
+    if !status.success() {
+        return Err(AppError::Output(format!("pbcopy 退出异常：{status}")));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn write_text_to_clipboard(text: &str) -> Result<(), AppError> {
+    windows_input::write_clipboard_text(text)
+        .map_err(|error| AppError::Output(format!("写入剪贴板失败：{error}")))
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn write_text_to_clipboard(text: &str) -> Result<(), AppError> {
     let mut child = Command::new("pbcopy")
         .stdin(Stdio::piped())
@@ -1129,7 +1284,12 @@ fn paste_clipboard_to_frontmost_app() -> Result<(), AppError> {
     macos_input::send_command_v().map_err(AppError::Output)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn paste_clipboard_to_frontmost_app() -> Result<(), AppError> {
+    windows_input::send_ctrl_v().map_err(AppError::Output)
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn paste_clipboard_to_frontmost_app() -> Result<(), AppError> {
     run_osascript(
         r#"tell application "System Events" to keystroke "v" using command down"#,
@@ -1137,7 +1297,7 @@ fn paste_clipboard_to_frontmost_app() -> Result<(), AppError> {
     )
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn run_osascript(script: &str, context: &str) -> Result<(), AppError> {
     let output = Command::new("osascript")
         .args(["-e", script])
@@ -1230,7 +1390,9 @@ fn transcribe_with_whisper(audio: Vec<u8>, config: &AppConfig) -> Result<String,
 fn transcribe_with_funasr(audio: Vec<u8>, config: &AppConfig) -> Result<String, AppError> {
     let endpoint = normalize_endpoint(config.funasr_endpoint.trim());
     if endpoint.is_empty() {
-        return Err(AppError::WhisperFailed("请先配置 FunASR 服务地址".to_string()));
+        return Err(AppError::WhisperFailed(
+            "请先配置 FunASR 服务地址".to_string(),
+        ));
     }
     let temp_dir = Builder::new()
         .prefix("local-voice-assistant-funasr-")
@@ -1280,7 +1442,10 @@ async fn check_funasr_health(config: &AppConfig) -> Result<FunAsrHealthView, Str
     if !response.status().is_success() {
         return Err(format!("FunASR 服务异常：{}", response.status()));
     }
-    let value = response.json::<Value>().await.map_err(|error| error.to_string())?;
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(FunAsrHealthView {
         ok: value.get("ok").and_then(Value::as_bool).unwrap_or(false),
         message: "FunASR 服务可用".to_string(),
@@ -1308,8 +1473,14 @@ fn parse_funasr_endpoint(endpoint: &str) -> (String, String) {
         .trim_start_matches("https://")
         .trim_end_matches('/');
     let mut parts = endpoint.split(':');
-    let host = parts.next().filter(|value| !value.is_empty()).unwrap_or("127.0.0.1");
-    let port = parts.next().filter(|value| !value.is_empty()).unwrap_or("10095");
+    let host = parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("127.0.0.1");
+    let port = parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("10095");
     (host.to_string(), port.to_string())
 }
 
@@ -1460,7 +1631,9 @@ async fn call_cloud_deepseek_correction(
         .json(&json!({ "input": input, "prompt": prompt }))
         .send()
         .await
-        .map_err(|error| AppError::DeepSeekFailed(format!("服务端 DeepSeek 代理不可用：{error}")))?;
+        .map_err(|error| {
+            AppError::DeepSeekFailed(format!("服务端 DeepSeek 代理不可用：{error}"))
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1489,7 +1662,9 @@ async fn call_cloud_deepseek_translation(
         }))
         .send()
         .await
-        .map_err(|error| AppError::DeepSeekFailed(format!("服务端 DeepSeek 代理不可用：{error}")))?;
+        .map_err(|error| {
+            AppError::DeepSeekFailed(format!("服务端 DeepSeek 代理不可用：{error}"))
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1627,8 +1802,7 @@ fn default_whisper_model_path_for_app(app: &AppHandle) -> String {
         bundled_whisper_model_path(app)
             .or_else(|| {
                 let path = local_project_whisper_model_path();
-                path.is_file()
-                    .then(|| path.to_string_lossy().to_string())
+                path.is_file().then(|| path.to_string_lossy().to_string())
             })
             .unwrap_or_else(|| {
                 local_project_whisper_model_path()
@@ -1639,7 +1813,9 @@ fn default_whisper_model_path_for_app(app: &AppHandle) -> String {
 }
 
 fn default_model_profiles_for_app(app: &AppHandle) -> Vec<WhisperModelProfile> {
-    vec![default_tiny_model_profile(default_whisper_model_path_for_app(app))]
+    vec![default_tiny_model_profile(
+        default_whisper_model_path_for_app(app),
+    )]
 }
 
 fn default_tiny_model_profile(path: String) -> WhisperModelProfile {

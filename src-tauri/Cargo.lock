@@ -2000,7 +2000,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "local-voice-assistant"
-version = "0.1.5"
+version = "0.1.8"
 dependencies = [
  "block2",
  "core-foundation 0.10.1",
@@ -2018,6 +2018,7 @@ dependencies = [
  "tauri-plugin-global-shortcut",
  "tempfile",
  "thiserror 1.0.69",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

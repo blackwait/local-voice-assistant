@@ -466,8 +466,9 @@ function MainApp() {
       return true;
     } catch (err) {
       const message = toUserFacingError(err);
-      setError(`${message}。文本已尽量写入剪贴板，可手动 Command+V 粘贴。`);
-      void showOverlayState("error", "自动粘贴失败", processingSeconds, "已尝试写入剪贴板，可手动 Command+V", 0.1, {
+      const pasteShortcut = manualPasteShortcut();
+      setError(`${message}。文本已尽量写入剪贴板，可手动 ${pasteShortcut} 粘贴。`);
+      void showOverlayState("error", "自动粘贴失败", processingSeconds, `已尝试写入剪贴板，可手动 ${pasteShortcut}`, 0.1, {
         transcribeSeconds,
         correctionSeconds,
         translationSeconds
@@ -1530,6 +1531,12 @@ function toUserFacingError(error: unknown) {
     return "本地 Whisper 模型不可用：应用会优先使用 FunASR；如需离线识别，可在“模型设置”填写有效模型路径。";
   }
   return message;
+}
+
+function manualPasteShortcut() {
+  const platform = navigator.platform.toLowerCase();
+  const userAgent = navigator.userAgent.toLowerCase();
+  return platform.includes("mac") || userAgent.includes("mac os") ? "Command+V" : "Ctrl+V";
 }
 
 function normalizeShortcut(event: KeyboardEvent) {
