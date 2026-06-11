@@ -47,6 +47,12 @@ export interface FunAsrHealthView {
   device: string;
 }
 
+export interface VoiceHistoryItem {
+  id: string;
+  text: string;
+  created_at: number;
+}
+
 export function getAppConfig() {
   return invoke<AppConfig>("get_app_config");
 }
@@ -100,6 +106,26 @@ export function translateText(input: string, targetLanguage: string) {
 
 export function outputTextToCursor(text: string) {
   return invoke<void>("output_text_to_cursor", { text });
+}
+
+export function copyTextToClipboard(text: string) {
+  return invoke<void>("copy_text_to_clipboard", { text });
+}
+
+export function recordVoiceHistory(text: string) {
+  return invoke<VoiceHistoryItem>("record_voice_history", { text });
+}
+
+export function listVoiceHistory() {
+  return invoke<VoiceHistoryItem[]>("list_voice_history");
+}
+
+export function deleteVoiceHistory(id: string) {
+  return invoke<VoiceHistoryItem[]>("delete_voice_history", { id });
+}
+
+export function clearVoiceHistory() {
+  return invoke<void>("clear_voice_history");
 }
 
 export function polishAndTranslate(input: string, targetLanguage: string) {

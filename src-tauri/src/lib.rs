@@ -19,9 +19,9 @@ use std::process::Command;
 use std::process::Stdio;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tempfile::Builder;
 use thiserror::Error;
 
@@ -34,6 +34,7 @@ const OVERLAY_STATE_EVENT: &str = "voice-overlay-state";
 const LEGACY_VOICE_TRANSCRIBER_MODEL_DIR: &str =
     "/Users/black/IdeaProjects/voice-transcriber-tauri/models/";
 const RECORDING_STARTUP_TIMEOUT_SECONDS: u64 = 15;
+const MAX_VOICE_HISTORY_ITEMS: usize = 100;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -167,6 +168,13 @@ struct FunAsrHealthView {
     device: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VoiceHistoryItem {
+    id: String,
+    text: String,
+    created_at: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct DeepSeekChoice {
     message: DeepSeekMessage,
@@ -221,6 +229,38 @@ fn save_config(app: AppHandle, mut config: AppConfig) -> Result<AppConfigView, S
 #[tauri::command]
 fn output_text_to_cursor(app: AppHandle, text: String) -> Result<(), String> {
     output_text_to_cursor_inner(&app, text).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn copy_text_to_clipboard(text: String) -> Result<(), String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(());
+    }
+    write_text_to_clipboard(text).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn record_voice_history(app: AppHandle, text: String) -> Result<VoiceHistoryItem, String> {
+    record_voice_history_inner(&app, text).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_voice_history(app: AppHandle) -> Result<Vec<VoiceHistoryItem>, String> {
+    read_voice_history(&app).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn delete_voice_history(app: AppHandle, id: String) -> Result<Vec<VoiceHistoryItem>, String> {
+    let mut items = read_voice_history(&app).map_err(|error| error.to_string())?;
+    items.retain(|item| item.id != id);
+    write_voice_history(&app, &items).map_err(|error| error.to_string())?;
+    Ok(items)
+}
+
+#[tauri::command]
+fn clear_voice_history(app: AppHandle) -> Result<(), String> {
+    write_voice_history(&app, &[]).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -987,9 +1027,6 @@ fn normalize_config(_app: &AppHandle, config: &mut AppConfig) {
     if config.deepseek_api_key.trim().is_empty() {
         config.deepseek_api_key = DEFAULT_DEEPSEEK_API_KEY.to_string();
     }
-    if config.record_shortcut.trim() == "F1" {
-        config.record_shortcut = default_record_shortcut();
-    }
     config
         .whisper_model_profiles
         .retain(|profile| !is_legacy_voice_transcriber_model_path(profile.path.trim()));
@@ -1043,9 +1080,10 @@ fn register_record_shortcut(app: &AppHandle, config: &AppConfig) -> Result<(), S
     if !config.shortcut_enabled || config.record_shortcut.trim().is_empty() {
         return Ok(());
     }
-    let shortcut = config.record_shortcut.trim().to_string();
+    let shortcut_text = config.record_shortcut.trim().to_string();
+    let shortcut = parse_record_shortcut(&shortcut_text)?;
     app.global_shortcut()
-        .on_shortcut(shortcut.as_str(), move |app, _shortcut, event| {
+        .on_shortcut(shortcut, move |app, _shortcut, event| {
             if event.state() == ShortcutState::Pressed {
                 if is_recording(app) {
                     show_voice_overlay(app, "stop");
@@ -1080,6 +1118,49 @@ fn register_record_shortcut(app: &AppHandle, config: &AppConfig) -> Result<(), S
             }
         })
         .map_err(|error| format!("Unable to register hotkey: {error}"))
+}
+
+fn parse_record_shortcut(shortcut: &str) -> Result<Shortcut, String> {
+    let shortcut = shortcut.trim();
+    if shortcut.is_empty() {
+        return Err("快捷键不能为空".to_string());
+    }
+    if let Ok(parsed) = shortcut.parse::<Shortcut>() {
+        return Ok(parsed);
+    }
+    parse_physical_code_shortcut(shortcut)
+}
+
+fn parse_physical_code_shortcut(shortcut: &str) -> Result<Shortcut, String> {
+    let tokens: Vec<&str> = shortcut.split('+').map(str::trim).filter(|token| !token.is_empty()).collect();
+    let (key_token, modifier_tokens) = tokens
+        .split_last()
+        .ok_or_else(|| format!("快捷键格式不支持：{shortcut}"))?;
+    let code = key_token
+        .parse::<Code>()
+        .map_err(|_| format!("快捷键格式不支持：{shortcut}"))?;
+    let mut modifiers = Modifiers::empty();
+    for token in modifier_tokens {
+        match token.to_uppercase().as_str() {
+            "OPTION" | "ALT" => modifiers |= Modifiers::ALT,
+            "CONTROL" | "CTRL" => modifiers |= Modifiers::CONTROL,
+            "COMMAND" | "CMD" | "SUPER" => modifiers |= Modifiers::SUPER,
+            "SHIFT" => modifiers |= Modifiers::SHIFT,
+            "COMMANDORCONTROL" | "COMMANDORCTRL" | "CMDORCTRL" | "CMDORCONTROL" => {
+                #[cfg(target_os = "macos")]
+                {
+                    modifiers |= Modifiers::SUPER;
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    modifiers |= Modifiers::CONTROL;
+                }
+            }
+            _ => return Err(format!("快捷键格式不支持：{shortcut}")),
+        }
+    }
+    let modifiers = if modifiers.is_empty() { None } else { Some(modifiers) };
+    Ok(Shortcut::new(modifiers, code))
 }
 
 fn transcribe_recording_from_hotkey(app: AppHandle) {
@@ -1148,6 +1229,7 @@ fn is_recording(app: &AppHandle) -> bool {
 
 fn show_voice_overlay(app: &AppHandle, action: &str) {
     if let Some(overlay) = app.get_webview_window(OVERLAY_LABEL) {
+        prepare_voice_overlay(&overlay);
         let _ = overlay.show();
         let _ = overlay.set_always_on_top(true);
         let (stage, status, text, level) = if action == "stop" {
@@ -1168,10 +1250,16 @@ fn emit_overlay_state(
     level: f64,
 ) {
     if let Some(overlay) = app.get_webview_window(OVERLAY_LABEL) {
+        prepare_voice_overlay(&overlay);
         let _ = overlay.show();
         let _ = overlay.set_always_on_top(true);
         emit_overlay_state_to_window(&overlay, stage, status, seconds, text, level);
     }
+}
+
+fn prepare_voice_overlay(overlay: &tauri::WebviewWindow) {
+    #[cfg(target_os = "macos")]
+    let _ = overlay.set_focusable(false);
 }
 
 fn emit_overlay_state_to_window(
@@ -1212,6 +1300,66 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data_dir(app)?.join("config.json"))
+}
+
+fn voice_history_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data_dir(app)?.join("voice-history.json"))
+}
+
+fn read_voice_history(app: &AppHandle) -> Result<Vec<VoiceHistoryItem>, AppError> {
+    let path = voice_history_path(app).map_err(AppError::Io)?;
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(path).map_err(|error| AppError::Io(error.to_string()))?;
+    let mut items: Vec<VoiceHistoryItem> =
+        serde_json::from_str(&text).map_err(|error| AppError::Io(error.to_string()))?;
+    normalize_voice_history(&mut items);
+    Ok(items)
+}
+
+fn write_voice_history(app: &AppHandle, items: &[VoiceHistoryItem]) -> Result<(), AppError> {
+    let path = voice_history_path(app).map_err(AppError::Io)?;
+    ensure_parent(&path).map_err(AppError::Io)?;
+    let mut next_items = items.to_vec();
+    normalize_voice_history(&mut next_items);
+    let text =
+        serde_json::to_string_pretty(&next_items).map_err(|error| AppError::Io(error.to_string()))?;
+    fs::write(path, text).map_err(|error| AppError::Io(error.to_string()))
+}
+
+fn record_voice_history_inner(app: &AppHandle, text: String) -> Result<VoiceHistoryItem, AppError> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(AppError::Io("历史文本为空".to_string()));
+    }
+    let created_at = current_timestamp_millis();
+    let item = VoiceHistoryItem {
+        id: format!("voice-{created_at}-{}", text.len()),
+        text: text.to_string(),
+        created_at,
+    };
+    let mut items = read_voice_history(app)?;
+    items.insert(0, item.clone());
+    normalize_voice_history(&mut items);
+    write_voice_history(app, &items)?;
+    Ok(item)
+}
+
+fn normalize_voice_history(items: &mut Vec<VoiceHistoryItem>) {
+    items.retain(|item| !item.text.trim().is_empty());
+    items.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    items.dedup_by(|left, right| left.id == right.id);
+    if items.len() > MAX_VOICE_HISTORY_ITEMS {
+        items.truncate(MAX_VOICE_HISTORY_ITEMS);
+    }
+}
+
+fn current_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 fn output_text_to_cursor_inner(app: &AppHandle, text: String) -> Result<(), AppError> {
@@ -1553,14 +1701,14 @@ async fn call_deepseek_correction(
     if content.trim().is_empty() {
         return Ok(fallback_correction_result(
             input,
-            "AI 纠错返回空内容，已保留识别文本。",
+            "AI 润色返回空内容，已保留识别文本。",
         ));
     }
 
     parse_correction_result(&content).or_else(|error| {
         Ok(fallback_correction_result(
             input,
-            format!("AI 纠错结果不是有效 JSON，已保留识别文本：{error}").as_str(),
+            format!("AI 润色结果不是有效 JSON，已保留识别文本：{error}").as_str(),
         ))
     })
 }
@@ -1696,7 +1844,7 @@ fn effective_polish_prompt(config: &AppConfig) -> String {
 }
 
 fn build_correction_prompt() -> String {
-    r#"你是一个语音识别纠错助手。
+    r#"你是一个语音识别润色助手。
 你的任务：
 1. 修正 ASR 语音识别导致的错字、同音词、断句错误和口语停顿。
 2. 保留说话人的原意，不扩写、不编造事实。
@@ -1705,7 +1853,7 @@ fn build_correction_prompt() -> String {
 
 JSON 字段：
 - corrected_text: string，纠正后的原文。
-- notes: string[]，最多 3 条，说明关键纠错点；没有就返回空数组。
+- notes: string[]，最多 3 条，说明关键润色点；没有就返回空数组。
 - confidence: string，只能是 high / medium / low。
 "#
     .to_string()
@@ -1849,6 +1997,11 @@ pub fn run() {
             load_config,
             save_config,
             output_text_to_cursor,
+            copy_text_to_clipboard,
+            record_voice_history,
+            list_voice_history,
+            delete_voice_history,
+            clear_voice_history,
             start_native_recording,
             cancel_native_recording,
             close_voice_overlay,

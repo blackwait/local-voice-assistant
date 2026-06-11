@@ -1,18 +1,44 @@
-import { Bot, Check, Home, Keyboard, Languages, Loader2, Mic, Pause, RotateCcw, Save, Server, Settings2, Sparkles, X } from "lucide-react";
+import {
+  Bot,
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
+  History,
+  Home,
+  Keyboard,
+  Languages,
+  Loader2,
+  Mic,
+  Pause,
+  RotateCcw,
+  Save,
+  Server,
+  Settings2,
+  Sparkles,
+  Trash2,
+  X
+} from "lucide-react";
 import { emitTo, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, Window } from "@tauri-apps/api/window";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AssistantResult,
   AppConfig,
+  VoiceHistoryItem,
   WhisperModelProfile,
   cancelNativeRecording,
   checkFunasrService,
   closeVoiceOverlay,
+  clearVoiceHistory,
+  copyTextToClipboard,
+  deleteVoiceHistory,
   getDefaultPolishPrompt,
+  listVoiceHistory,
   loadConfig,
   outputTextToCursor,
   polishText,
+  recordVoiceHistory,
   saveConfig,
   startFunasrService,
   startNativeRecording,
@@ -20,8 +46,8 @@ import {
   translateText
 } from "./tauri";
 
-type Stage = "idle" | "recording" | "stopping" | "transcribing" | "recognized" | "polishing" | "done" | "error";
-type Section = "home" | "model" | "hotkey" | "ai";
+type Stage = "idle" | "recording" | "stopping" | "transcribing" | "recognized" | "polishing" | "translating" | "done" | "error";
+type Section = "home" | "history" | "model" | "hotkey" | "ai";
 type VoiceOverlayState = {
   stage: Stage;
   status: string;
@@ -45,7 +71,8 @@ type TranscribedPayload = {
 };
 
 const MAX_SECONDS = 60;
-const PROCESSING_STAGES: Stage[] = ["stopping", "transcribing", "recognized", "polishing"];
+const HISTORY_PAGE_SIZE = 10;
+const PROCESSING_STAGES: Stage[] = ["stopping", "transcribing", "recognized", "polishing", "translating"];
 const MAIN_LABEL = "main";
 const OVERLAY_LABEL = "voice-overlay";
 const OVERLAY_STATE_EVENT = "voice-overlay-state";
@@ -72,7 +99,7 @@ const DEFAULT_CONFIG: AppConfig = {
   shortcut_enabled: true,
   polish_prompt: ""
 };
-const SHORTCUT_PRESETS = ["CommandOrControl+1", "CommandOrControl+Shift+Space", "CommandOrControl+Alt+Space", "CommandOrControl+Shift+R"];
+const SHORTCUT_PRESETS = ["F2", "F3", "F4", "F8", "CapsLock", "CommandOrControl+1", "CommandOrControl+Shift+Space", "CommandOrControl+Alt+Space"];
 
 export function App() {
   if (getSafeWindowLabel() === OVERLAY_LABEL) {
@@ -107,6 +134,10 @@ function MainApp() {
   const [modelNameDraft, setModelNameDraft] = useState("");
   const [modelPathDraft, setModelPathDraft] = useState("");
   const [transcript, setTranscript] = useState("");
+  const [historyItems, setHistoryItems] = useState<VoiceHistoryItem[]>([]);
+  const [historyPage, setHistoryPage] = useState(1);
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const [historyMessage, setHistoryMessage] = useState("");
   const [targetLanguage, setTargetLanguage] = useState("中文");
   const [result, setResult] = useState<AssistantResult>();
   const [error, setError] = useState("");
@@ -129,6 +160,12 @@ function MainApp() {
   useEffect(() => {
     targetLanguageRef.current = targetLanguage;
   }, [targetLanguage]);
+
+  useEffect(() => {
+    if (activeSection === "history") {
+      void refreshHistory();
+    }
+  }, [activeSection]);
 
   useEffect(() => {
     stageRef.current = stage;
@@ -217,17 +254,69 @@ function MainApp() {
     if (!isCapturingShortcut) {
       return;
     }
+    const captureState = {
+      pressedModifiers: new Set<string>(),
+      chordModifiers: new Set<string>(),
+      chordCommitted: false
+    };
+    const resetCaptureState = () => {
+      captureState.pressedModifiers.clear();
+      captureState.chordModifiers.clear();
+      captureState.chordCommitted = false;
+    };
+    const commitShortcut = (shortcut: string) => {
+      resetCaptureState();
+      void saveShortcut(shortcut);
+    };
     const handler = (event: KeyboardEvent) => {
       event.preventDefault();
       event.stopPropagation();
+      if (event.repeat) {
+        return;
+      }
+      const key = normalizeKey(event);
+      if (!key) {
+        return;
+      }
+      if (isPhysicalModifierKey(key)) {
+        captureState.pressedModifiers.add(key);
+        captureState.chordModifiers.add(key);
+        return;
+      }
       const shortcut = normalizeShortcut(event);
       if (!shortcut) {
         return;
       }
-      void saveShortcut(shortcut);
+      captureState.chordCommitted = true;
+      commitShortcut(shortcut);
     };
+    const releaseHandler = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const key = normalizeKey(event);
+      if (!key || !isPhysicalModifierKey(key)) {
+        return;
+      }
+      captureState.pressedModifiers.delete(key);
+      if (captureState.chordCommitted || captureState.pressedModifiers.size > 0) {
+        return;
+      }
+      const shortcut = buildModifierOnlyShortcut(captureState.chordModifiers);
+      if (shortcut) {
+        commitShortcut(shortcut);
+      } else {
+        resetCaptureState();
+      }
+    };
+    const blurHandler = () => resetCaptureState();
     window.addEventListener("keydown", handler, true);
-    return () => window.removeEventListener("keydown", handler, true);
+    window.addEventListener("keyup", releaseHandler, true);
+    window.addEventListener("blur", blurHandler, true);
+    return () => {
+      window.removeEventListener("keydown", handler, true);
+      window.removeEventListener("keyup", releaseHandler, true);
+      window.removeEventListener("blur", blurHandler, true);
+    };
   }, [isCapturingShortcut, config]);
 
   const progress = useMemo(() => `${Math.min(100, (seconds / MAX_SECONDS) * 100)}%`, [seconds]);
@@ -391,9 +480,10 @@ function MainApp() {
       return;
     }
     transitionStage("polishing");
-    void showOverlayState("polishing", "AI 正在纠错", 0, "正在修正错词、断句和标点", 0.45, {
+    await showOverlayState("polishing", "AI 正在润色", 0, "正在润色文本、整理断句和标点", 0.45, {
       transcribeSeconds: nextTranscribeSeconds
     });
+    await settleOverlayStage();
     const correctionStartedAt = performance.now();
     const correction = await polishText(text);
     if (voiceInputCanceledRef.current) {
@@ -419,10 +509,12 @@ function MainApp() {
       return;
     }
 
-    void showOverlayState("polishing", "实时翻译中", 0, `正在翻译为${currentTargetLanguage}`, 0.5, {
+    transitionStage("translating");
+    await showOverlayState("translating", "实时翻译中", 0, `正在翻译为${currentTargetLanguage}`, 0.5, {
       transcribeSeconds: nextTranscribeSeconds,
       correctionSeconds: nextCorrectionSeconds
     });
+    await settleOverlayStage();
     const translationStartedAt = performance.now();
     const translation = await translateText(correction.corrected_text, currentTargetLanguage);
     if (voiceInputCanceledRef.current) {
@@ -454,6 +546,7 @@ function MainApp() {
     if (!finalText) {
       return true;
     }
+    await saveHistoryText(finalText);
     try {
       await outputTextToCursor(finalText);
       return true;
@@ -467,6 +560,74 @@ function MainApp() {
         translationSeconds
       });
       return false;
+    }
+  }
+
+  async function saveHistoryText(text: string) {
+    try {
+      const item = await recordVoiceHistory(text);
+      setHistoryItems((items) => [item, ...items.filter((current) => current.id !== item.id)].slice(0, 100));
+    } catch (err) {
+      setHistoryMessage(`历史记录保存失败：${toUserFacingError(err)}`);
+    }
+  }
+
+  async function refreshHistory() {
+    setHistoryBusy(true);
+    setHistoryMessage("");
+    try {
+      const items = await listVoiceHistory();
+      setHistoryItems(items);
+      setHistoryPage((page) => clampHistoryPage(page, items.length));
+    } catch (err) {
+      setHistoryMessage(toUserFacingError(err));
+    } finally {
+      setHistoryBusy(false);
+    }
+  }
+
+  async function copyHistoryText(text: string) {
+    setHistoryMessage("");
+    try {
+      await copyTextToClipboard(text);
+      setHistoryMessage("已复制到剪贴板");
+    } catch (err) {
+      setHistoryMessage(toUserFacingError(err));
+    }
+  }
+
+  async function removeHistoryItem(id: string) {
+    setHistoryBusy(true);
+    setHistoryMessage("");
+    try {
+      const items = await deleteVoiceHistory(id);
+      setHistoryItems(items);
+      setHistoryPage((page) => clampHistoryPage(page, items.length));
+    } catch (err) {
+      setHistoryMessage(toUserFacingError(err));
+    } finally {
+      setHistoryBusy(false);
+    }
+  }
+
+  async function removeAllHistory() {
+    if (!historyItems.length) {
+      return;
+    }
+    if (!window.confirm("确认清空全部历史语音记录？")) {
+      return;
+    }
+    setHistoryBusy(true);
+    setHistoryMessage("");
+    try {
+      await clearVoiceHistory();
+      setHistoryItems([]);
+      setHistoryPage(1);
+      setHistoryMessage("历史记录已清空");
+    } catch (err) {
+      setHistoryMessage(toUserFacingError(err));
+    } finally {
+      setHistoryBusy(false);
     }
   }
 
@@ -774,6 +935,7 @@ function MainApp() {
 
       <nav className="page-tabs">
         <TabButton active={activeSection === "home"} icon={<Home size={16} />} label="首页" onClick={() => setActiveSection("home")} />
+        <TabButton active={activeSection === "history"} icon={<History size={16} />} label="历史语音" onClick={() => setActiveSection("history")} />
         <TabButton active={activeSection === "model"} icon={<Settings2 size={16} />} label="模型设置" onClick={() => setActiveSection("model")} />
         <TabButton active={activeSection === "hotkey"} icon={<Keyboard size={16} />} label="快捷键" onClick={() => setActiveSection("hotkey")} />
         <TabButton active={activeSection === "ai"} icon={<Bot size={16} />} label="AI 设置" onClick={() => setActiveSection("ai")} />
@@ -835,7 +997,7 @@ function MainApp() {
                   void saveConfig(nextConfig).then(setConfig).catch((err) => setError(toUserFacingError(err)));
                 }}
               />
-              <span>{config.translation_enabled ? "实时翻译已启用" : "实时翻译已关闭"}</span>
+              <span>{config.translation_enabled ? "实时翻译已启用" : "如有需要请手动开启"}</span>
             </label>
 
             <div className="config-box">
@@ -871,14 +1033,14 @@ function MainApp() {
             <div className="columns">
               <TextBlock title="本地识别" icon={<Mic size={16} />} value={transcript || emptyTranscriptText(stage)} />
               <TextBlock
-                title="纠错后文本"
+                title="AI 润色"
                 icon={<Sparkles size={16} />}
                 value={result?.corrected_text || emptyCorrectedText(stage)}
               />
               <TextBlock
                 title="实时翻译"
                 icon={<Languages size={16} />}
-                value={!config.translation_enabled ? "实时翻译已关闭，只输出纠错后文本。" : result?.translation || emptyTranslationText(stage)}
+                value={!config.translation_enabled ? "如有需要请手动开启" : result?.translation || emptyTranslationText(stage)}
               />
             </div>
 
@@ -886,7 +1048,7 @@ function MainApp() {
               <div className="notes">
                 <div className="notes-title">
                   <Check size={16} />
-                  纠错依据
+                  润色依据
                 </div>
                 {result.notes.map((note) => (
                   <p key={note}>{note}</p>
@@ -894,6 +1056,68 @@ function MainApp() {
               </div>
             ) : null}
           </section>
+        </section>
+      ) : null}
+
+      {activeSection === "history" ? (
+        <section className="history-panel">
+          <header className="history-head">
+            <div>
+              <h2>历史语音</h2>
+              <p>自动保留最近 100 条 AI 润色文本，可复制或删除。</p>
+            </div>
+            <div className="history-actions">
+              <button className="icon-button wide" disabled={historyBusy} onClick={() => void refreshHistory()}>
+                {historyBusy ? <Loader2 size={16} className="spin" /> : <RotateCcw size={16} />}
+                刷新
+              </button>
+              <button className="icon-button wide danger-text" disabled={historyBusy || !historyItems.length} onClick={() => void removeAllHistory()}>
+                <Trash2 size={16} />
+                清空
+              </button>
+            </div>
+          </header>
+
+          {historyMessage ? <div className={historyMessage.includes("失败") ? "error-box" : "info-box"}>{historyMessage}</div> : null}
+
+          {historyItems.length ? (
+            <>
+              <div className="history-list">
+                {paginatedHistoryItems(historyItems, historyPage).map((item) => (
+                  <article className="history-item" key={item.id}>
+                    <div className="history-item-meta">
+                      <span>{formatHistoryTime(item.created_at)}</span>
+                      <small>{item.text.length} 字</small>
+                    </div>
+                    <p>{item.text}</p>
+                    <div className="history-item-actions">
+                      <button className="icon-button wide" onClick={() => void copyHistoryText(item.text)}>
+                        <Copy size={16} />
+                        复制
+                      </button>
+                      <button className="icon-button wide danger-text" disabled={historyBusy} onClick={() => void removeHistoryItem(item.id)}>
+                        <Trash2 size={16} />
+                        删除
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+              <HistoryPager
+                page={historyPage}
+                total={historyItems.length}
+                pageSize={HISTORY_PAGE_SIZE}
+                onPrev={() => setHistoryPage((page) => Math.max(1, page - 1))}
+                onNext={() => setHistoryPage((page) => Math.min(historyPageCount(historyItems.length), page + 1))}
+              />
+            </>
+          ) : (
+            <div className="history-empty">
+              <History size={30} />
+              <strong>暂无历史语音</strong>
+              <span>完成一次语音输入后，AI 润色文本会自动出现在这里。</span>
+            </div>
+          )}
         </section>
       ) : null}
 
@@ -996,7 +1220,7 @@ function MainApp() {
       ) : null}
 
       {activeSection === "hotkey" ? (
-        <SettingsPanel title="快捷键" subtitle="录制任意键位组合，保存后可在任意窗口触发语音输入">
+        <SettingsPanel title="快捷键" subtitle="录制任意键位或组合，保存后可在任意窗口触发语音输入">
           <SettingRow title="启用快捷键" desc="关闭后不会监听全局键盘快捷键">
             <label className="switch-row">
               <input
@@ -1011,7 +1235,7 @@ function MainApp() {
               <span>{config.shortcut_enabled ? "已启用" : "已关闭"}</span>
             </label>
           </SettingRow>
-          <SettingRow title="当前快捷键" desc={shortcutError || "按一次开始录音，再按一次结束并处理"}>
+          <SettingRow title="当前快捷键" desc={shortcutError || "支持单键、功能键、符号键、数字键、小键盘、修饰键和组合键"}>
             <div className="shortcut-control">
               <kbd>{config.record_shortcut || "未设置"}</kbd>
               <button className={isCapturingShortcut ? "primary danger" : "primary"} onClick={() => setIsCapturingShortcut(true)}>
@@ -1020,7 +1244,7 @@ function MainApp() {
               </button>
             </div>
           </SettingRow>
-          <SettingRow title="推荐快捷键" desc="F1 经常被系统或其他软件占用，建议使用组合键">
+          <SettingRow title="快捷键预设" desc="这里只是快捷入口；也可以点击录制后直接按任意键位">
             <div className="shortcut-presets">
               {SHORTCUT_PRESETS.map((shortcut) => (
                 <button key={shortcut} className="icon-button wide" onClick={() => void saveShortcut(shortcut)}>
@@ -1050,7 +1274,7 @@ function MainApp() {
               placeholder="sk-..."
             />
           </SettingRow>
-          <SettingRow title="DeepSeek 模型" desc="用于纠错、补标点和翻译">
+          <SettingRow title="DeepSeek 模型" desc="用于 AI 润色、补标点和翻译">
             <input value={config.deepseek_model} onChange={(event) => updateConfig({ deepseek_model: event.target.value })} />
           </SettingRow>
           <SettingRow title="DeepSeek 服务地址" desc="留空时本机直连；填写云端地址后由服务端代理调用">
@@ -1060,7 +1284,7 @@ function MainApp() {
               placeholder="http://10.254.81.32:10095"
             />
           </SettingRow>
-          <SettingRow title="实时翻译" desc="关闭后只进行 AI 纠错，不再调用翻译接口">
+          <SettingRow title="实时翻译" desc="关闭后只进行 AI 润色，不再调用翻译接口">
             <label className="switch-row">
               <input
                 type="checkbox"
@@ -1074,7 +1298,7 @@ function MainApp() {
             <div className="setting-copy">
               <strong>AI 润色提示词</strong>
               <span>
-                自定义纠错/润色时发给 DeepSeek 的系统提示词，可随时编辑并保存。需保留 JSON 输出约定
+                自定义 AI 润色时发给 DeepSeek 的系统提示词，可随时编辑并保存。需保留 JSON 输出约定
                 （corrected_text / notes / confidence），否则可能解析失败。走服务端代理时，需要服务端运行最新版才会生效。
               </span>
             </div>
@@ -1219,15 +1443,7 @@ function VoiceOverlayWindow() {
           <i />
           <i />
         </div>
-        <div className="voice-orb" aria-hidden="true">
-          {overlay.stage === "polishing" || overlay.stage === "recognized" || overlay.stage === "done" ? (
-            <Sparkles size={18} />
-          ) : overlay.stage === "stopping" ? (
-            <Pause size={18} />
-          ) : (
-            <Mic size={18} />
-          )}
-        </div>
+        <div className="voice-orb" aria-hidden="true">{overlayStageIcon(overlay.stage)}</div>
         <div className="voice-overlay-copy">
           <strong>{overlay.status}</strong>
           <span>{overlayTimeText(overlay)}</span>
@@ -1241,6 +1457,11 @@ function VoiceOverlayWindow() {
 
 function nextPaint() {
   return new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+}
+
+async function settleOverlayStage() {
+  await nextPaint();
+  await new Promise<void>((resolve) => window.setTimeout(resolve, 180));
 }
 
 function elapsedSeconds(startedAt: number) {
@@ -1266,7 +1487,8 @@ function overlayStatus(stage: Stage) {
     stopping: "正在停止录音",
     transcribing: "本地识别中",
     recognized: "识别完成",
-    polishing: "AI 正在处理",
+    polishing: "AI 正在润色",
+    translating: "实时翻译中",
     done: "处理完成",
     error: "处理失败"
   };
@@ -1280,7 +1502,8 @@ function overlayText(stage: Stage) {
     stopping: "正在收束音频并准备识别",
     transcribing: "Whisper 正在处理录音",
     recognized: "识别完成，准备后续处理",
-    polishing: "正在纠错、补标点并翻译",
+    polishing: "正在润色文本、整理标点",
+    translating: "正在生成目标语言版本",
     done: "结果已经写回主窗口",
     error: "请回到主窗口查看错误详情"
   };
@@ -1293,7 +1516,7 @@ function overlayTimeText(overlay: VoiceOverlayState) {
     parts.push(`识别 ${overlay.transcribeSeconds.toFixed(1)}s`);
   }
   if (overlay.correctionSeconds !== undefined) {
-    parts.push(`纠错 ${overlay.correctionSeconds.toFixed(1)}s`);
+    parts.push(`润色 ${overlay.correctionSeconds.toFixed(1)}s`);
   }
   if (overlay.translationSeconds !== undefined) {
     parts.push(`翻译 ${overlay.translationSeconds.toFixed(1)}s`);
@@ -1307,6 +1530,50 @@ function previewOverlayText(text: string) {
     return "处理完成";
   }
   return compactText.length > 34 ? `${compactText.slice(0, 34)}...` : compactText;
+}
+
+function historyPageCount(total: number) {
+  return Math.max(1, Math.ceil(total / HISTORY_PAGE_SIZE));
+}
+
+function clampHistoryPage(page: number, total: number) {
+  return Math.min(Math.max(1, page), historyPageCount(total));
+}
+
+function paginatedHistoryItems(items: VoiceHistoryItem[], page: number) {
+  const start = (page - 1) * HISTORY_PAGE_SIZE;
+  return items.slice(start, start + HISTORY_PAGE_SIZE);
+}
+
+function formatHistoryTime(timestamp: number) {
+  return new Date(timestamp).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+function overlayStageIcon(stage: Stage) {
+  if (stage === "stopping") {
+    return <Pause size={18} />;
+  }
+  if (stage === "transcribing") {
+    return <Bot size={18} />;
+  }
+  if (stage === "recognized" || stage === "done") {
+    return <Check size={18} />;
+  }
+  if (stage === "polishing") {
+    return <Sparkles size={18} />;
+  }
+  if (stage === "translating") {
+    return <Languages size={18} />;
+  }
+  if (stage === "error") {
+    return <X size={18} />;
+  }
+  return <Mic size={18} />;
 }
 
 function activeModelProfile(config: AppConfig) {
@@ -1370,13 +1637,50 @@ function SettingRow({ title, desc, children }: { title: string; desc: string; ch
   );
 }
 
+function HistoryPager({
+  page,
+  total,
+  pageSize,
+  onPrev,
+  onNext
+}: {
+  page: number;
+  total: number;
+  pageSize: number;
+  onPrev: () => void;
+  onNext: () => void;
+}) {
+  const pages = historyPageCount(total);
+  const start = total ? (page - 1) * pageSize + 1 : 0;
+  const end = Math.min(total, page * pageSize);
+  return (
+    <div className="history-pager">
+      <span>
+        {start}-{end} / {total}
+      </span>
+      <div>
+        <button className="icon-button" disabled={page <= 1} onClick={onPrev} title="上一页">
+          <ChevronLeft size={17} />
+        </button>
+        <strong>
+          {page} / {pages}
+        </strong>
+        <button className="icon-button" disabled={page >= pages} onClick={onNext} title="下一页">
+          <ChevronRight size={17} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function Pipeline({ stage }: { stage: Stage }) {
   const steps = [
     ["recording", "录音"],
     ["stopping", "整理录音"],
     ["transcribing", "本地识别"],
     ["recognized", "识别完成"],
-    ["polishing", "纠错翻译"]
+    ["polishing", "AI润色"],
+    ["translating", "翻译"]
   ] as const;
   const activeIndex = steps.findIndex(([key]) => key === stage);
 
@@ -1396,14 +1700,15 @@ function Pipeline({ stage }: { stage: Stage }) {
 }
 
 function ProcessingNotice({ stage, seconds }: { stage: Stage; seconds: number }) {
-  if (stage !== "stopping" && stage !== "transcribing" && stage !== "recognized" && stage !== "polishing") {
+  if (stage !== "stopping" && stage !== "transcribing" && stage !== "recognized" && stage !== "polishing" && stage !== "translating") {
     return null;
   }
-  const processingCopy: Record<"stopping" | "transcribing" | "recognized" | "polishing", [string, string]> = {
+  const processingCopy: Record<"stopping" | "transcribing" | "recognized" | "polishing" | "translating", [string, string]> = {
     stopping: ["正在整理录音", "正在结束麦克风采集并整理音频，通常只需要几秒。"],
     transcribing: ["本地识别中", "Whisper 模型正在处理录音，模型越大等待越久，界面会保持响应。"],
     recognized: ["识别完成", "本地转写已经完成，正在准备 AI 后续处理。"],
-    polishing: ["AI 正在处理", "正在处理转写文本，结果会自动写入右侧区域。"]
+    polishing: ["AI 正在润色", "正在润色文本、整理断句和标点，完成后会继续输出。"],
+    translating: ["实时翻译中", "正在生成目标语言版本，完成后会自动写入光标位置。"]
   };
   const copy = processingCopy[stage];
   return (
@@ -1439,7 +1744,7 @@ function TimingStats({
       </span>
       <span>
         <strong>{correctionSeconds === undefined ? "--" : `${correctionSeconds.toFixed(1)}s`}</strong>
-        纠错文本
+        AI 润色
       </span>
       <span>
         <strong>{translationSeconds === undefined ? "--" : `${translationSeconds.toFixed(1)}s`}</strong>
@@ -1473,22 +1778,25 @@ function emptyTranscriptText(stage: Stage) {
 
 function emptyCorrectedText(stage: Stage) {
   if (stage === "polishing") {
-    return "正在纠正语音错词、断句和标点";
+    return "正在进行 AI 润色、整理断句和标点";
   }
   if (stage === "stopping" || stage === "transcribing") {
-    return "识别完成后会自动进入 AI 纠错";
+    return "识别完成后会自动进入 AI 润色";
   }
-  return "识别完成后自动纠正语音错词";
+  return "识别完成后自动进行 AI 润色";
 }
 
 function emptyTranslationText(stage: Stage) {
-  if (stage === "polishing") {
+  if (stage === "translating") {
     return "正在生成目标语言版本";
+  }
+  if (stage === "polishing") {
+    return "AI 润色完成后会继续翻译";
   }
   if (stage === "stopping" || stage === "transcribing") {
     return "AI 处理完成后会显示翻译结果";
   }
-  return "纠错完成后自动翻译";
+    return "AI 润色完成后自动翻译";
 }
 
 function toUserFacingError(error: unknown) {
@@ -1515,7 +1823,7 @@ function toUserFacingError(error: unknown) {
     return "麦克风暂时不可用：可能被其他应用占用，请关闭占用麦克风的软件后重试。";
   }
   if (message.includes("RegisterEventHotKey failed") || message.includes("Unable to register hotkey")) {
-    return "快捷键已被系统或其他软件占用：请在“快捷键”页换成推荐组合键，例如 CommandOrControl+Alt+Space。";
+    return "快捷键已被系统或其他软件占用，或当前系统不允许注册该键位：请在“快捷键”页换成另一个键位。";
   }
   if (message.includes("DeepSeek key 未配置")) {
     return "DeepSeek key 未配置：请在 AI 设置中填写本机 API Key，或填写 DeepSeek 服务地址走服务端代理。";
@@ -1533,9 +1841,23 @@ function manualPasteShortcut() {
 }
 
 function normalizeShortcut(event: KeyboardEvent) {
-  const key = normalizeKey(event.key);
+  const key = normalizeKey(event);
   if (!key) {
     return "";
+  }
+  if (isPhysicalModifierKey(key)) {
+    const parts: string[] = [];
+    if ((event.metaKey || event.ctrlKey) && !key.startsWith("Meta") && !key.startsWith("Control")) {
+      parts.push("CommandOrControl");
+    }
+    if (event.altKey && !key.startsWith("Alt")) {
+      parts.push("Alt");
+    }
+    if (event.shiftKey && !key.startsWith("Shift")) {
+      parts.push("Shift");
+    }
+    parts.push(key);
+    return parts.join("+");
   }
   const parts: string[] = [];
   if (event.metaKey || event.ctrlKey) {
@@ -1551,9 +1873,22 @@ function normalizeShortcut(event: KeyboardEvent) {
   return parts.join("+");
 }
 
-function normalizeKey(key: string) {
-  if (["Control", "Meta", "Shift", "Alt"].includes(key)) {
-    return "";
+function buildModifierOnlyShortcut(modifiers: Set<string>) {
+  return ["ControlLeft", "ControlRight", "AltLeft", "AltRight", "ShiftLeft", "ShiftRight", "MetaLeft", "MetaRight"]
+    .filter((modifier) => modifiers.has(modifier))
+    .join("+");
+}
+
+function normalizeKey(event: KeyboardEvent) {
+  const { code, key } = event;
+  if (isPhysicalModifierKey(code)) {
+    return code;
+  }
+  if (code.startsWith("Numpad")) {
+    return code;
+  }
+  if (PHYSICAL_CODE_KEYS.has(code)) {
+    return code;
   }
   if (key === " ") {
     return "Space";
@@ -1575,7 +1910,69 @@ function normalizeKey(key: string) {
     Home: "Home",
     End: "End",
     PageUp: "PageUp",
-    PageDown: "PageDown"
+    PageDown: "PageDown",
+    CapsLock: "CapsLock",
+    PrintScreen: "PrintScreen",
+    ScrollLock: "ScrollLock",
+    NumLock: "NumLock",
+    ContextMenu: "ContextMenu"
   };
-  return keyMap[key] || key;
+  return keyMap[key] || code || key;
+}
+
+const PHYSICAL_CODE_KEYS = new Set([
+  "Backquote",
+  "Backslash",
+  "BracketLeft",
+  "BracketRight",
+  "Comma",
+  "Digit0",
+  "Digit1",
+  "Digit2",
+  "Digit3",
+  "Digit4",
+  "Digit5",
+  "Digit6",
+  "Digit7",
+  "Digit8",
+  "Digit9",
+  "Equal",
+  "IntlBackslash",
+  "IntlRo",
+  "IntlYen",
+  "KeyA",
+  "KeyB",
+  "KeyC",
+  "KeyD",
+  "KeyE",
+  "KeyF",
+  "KeyG",
+  "KeyH",
+  "KeyI",
+  "KeyJ",
+  "KeyK",
+  "KeyL",
+  "KeyM",
+  "KeyN",
+  "KeyO",
+  "KeyP",
+  "KeyQ",
+  "KeyR",
+  "KeyS",
+  "KeyT",
+  "KeyU",
+  "KeyV",
+  "KeyW",
+  "KeyX",
+  "KeyY",
+  "KeyZ",
+  "Minus",
+  "Period",
+  "Quote",
+  "Semicolon",
+  "Slash"
+]);
+
+function isPhysicalModifierKey(code: string) {
+  return ["AltLeft", "AltRight", "ControlLeft", "ControlRight", "MetaLeft", "MetaRight", "ShiftLeft", "ShiftRight"].includes(code);
 }

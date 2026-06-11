@@ -1,6 +1,6 @@
 {
   "name": "local-voice-assistant",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "private": true,
   "type": "module",
   "scripts": {
@@ -14,7 +14,8 @@
     "build": "tsc && vite build",
     "tauri:build": "tauri build",
     "package:mac": "scripts/build_and_sign_macos.sh",
-    "mac:signing-secret": "scripts/create_macos_internal_signing_secret.sh"
+    "mac:signing-secret": "scripts/create_macos_internal_signing_secret.sh",
+    "mac:fix-accessibility": "scripts/fix_macos_accessibility_permission.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
