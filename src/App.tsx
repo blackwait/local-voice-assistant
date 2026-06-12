@@ -52,7 +52,7 @@ import {
 } from "./tauri";
 
 type Stage = "idle" | "recording" | "stopping" | "transcribing" | "recognized" | "polishing" | "translating" | "done" | "error";
-type Section = "home" | "history" | "model" | "hotkey" | "ai";
+type Section = "home" | "permission" | "hotkey" | "ai" | "model" | "history";
 type VoiceOverlayState = {
   stage: Stage;
   status: string;
@@ -179,6 +179,9 @@ function MainApp() {
   useEffect(() => {
     if (activeSection === "history") {
       void refreshHistory();
+    }
+    if (activeSection === "permission") {
+      void refreshAccessibilityStatus();
     }
   }, [activeSection]);
 
@@ -1032,10 +1035,11 @@ function MainApp() {
 
       <nav className="page-tabs">
         <TabButton active={activeSection === "home"} icon={<Home size={16} />} label="首页" onClick={() => setActiveSection("home")} />
-        <TabButton active={activeSection === "history"} icon={<History size={16} />} label="历史语音" onClick={() => setActiveSection("history")} />
-        <TabButton active={activeSection === "model"} icon={<Settings2 size={16} />} label="模型设置" onClick={() => setActiveSection("model")} />
-        <TabButton active={activeSection === "hotkey"} icon={<Keyboard size={16} />} label="快捷键" onClick={() => setActiveSection("hotkey")} />
+        <TabButton active={activeSection === "permission"} icon={<ShieldCheck size={16} />} label="权限设置" onClick={() => setActiveSection("permission")} />
+        <TabButton active={activeSection === "hotkey"} icon={<Keyboard size={16} />} label="快捷键设置" onClick={() => setActiveSection("hotkey")} />
         <TabButton active={activeSection === "ai"} icon={<Bot size={16} />} label="AI 设置" onClick={() => setActiveSection("ai")} />
+        <TabButton active={activeSection === "model"} icon={<Settings2 size={16} />} label="模型设置" onClick={() => setActiveSection("model")} />
+        <TabButton active={activeSection === "history"} icon={<History size={16} />} label="历史语音" onClick={() => setActiveSection("history")} />
       </nav>
 
       {activeSection === "home" ? (
@@ -1113,39 +1117,6 @@ function MainApp() {
                 <dd>{config.asr_engine === "funasr" ? config.funasr_endpoint : config?.whisper_cli_path || "未配置"}</dd>
               </dl>
             </div>
-
-            {isMacos ? (
-              <div className={accessibilityStatus?.trusted ? "permission-box ok" : "permission-box warning"}>
-                <div className="permission-title">
-                  <ShieldCheck size={16} />
-                  <span>辅助功能{accessibilityStatus?.trusted ? "已授权" : "未授权"}</span>
-                </div>
-                {!accessibilityStatus?.trusted ? (
-                  <div className="permission-actions">
-                    <button className="primary" onClick={() => void openMacosAccessibilitySettings()}>
-                      打开系统设置
-                    </button>
-                    <button className="icon-button wide" onClick={() => void refreshAccessibilityStatus()}>
-                      重新检测
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-
-            <div className={recordingCheckOk === false ? "permission-box warning" : "permission-box ok"}>
-              <div className="permission-title">
-                <Mic size={16} />
-                <span>{recordingCheckOk === false ? "录音功能异常" : "录音功能检测"}</span>
-              </div>
-              {recordingCheckMessage ? <p className="permission-message">{recordingCheckMessage}</p> : null}
-              <div className="permission-actions single">
-                <button className="icon-button wide" disabled={recordingCheckBusy || busy} onClick={() => void checkRecording()}>
-                  {recordingCheckBusy ? <Loader2 size={16} className="spin" /> : <Mic size={16} />}
-                  {recordingCheckBusy ? "检测中" : "检测录音"}
-                </button>
-              </div>
-            </div>
           </aside>
 
           <section className="result-panel">
@@ -1187,6 +1158,45 @@ function MainApp() {
             ) : null}
           </section>
         </section>
+      ) : null}
+
+      {activeSection === "permission" ? (
+        <SettingsPanel title="权限设置" subtitle="语音输入需要麦克风权限；自动粘贴到光标处需要辅助功能权限，请确保以下权限已开启">
+          {isMacos ? (
+            <SettingRow
+              title="辅助功能权限"
+              desc={
+                accessibilityStatus?.trusted
+                  ? "已授权，可将识别结果自动粘贴到当前光标位置"
+                  : "未授权，授权后才能把语音结果自动粘贴到其他应用"
+              }
+            >
+              <div className="permission-actions">
+                {!accessibilityStatus?.trusted ? (
+                  <button className="primary" onClick={() => void openMacosAccessibilitySettings()}>
+                    打开系统设置
+                  </button>
+                ) : null}
+                <button className="icon-button wide" onClick={() => void refreshAccessibilityStatus()}>
+                  <RotateCcw size={16} />
+                  重新检测
+                </button>
+              </div>
+            </SettingRow>
+          ) : null}
+
+          <SettingRow
+            title="麦克风 / 录音"
+            desc={recordingCheckMessage || "检测麦克风是否可正常录音，首次检测会触发系统麦克风授权"}
+          >
+            <div className="permission-actions single">
+              <button className="icon-button wide" disabled={recordingCheckBusy || busy} onClick={() => void checkRecording()}>
+                {recordingCheckBusy ? <Loader2 size={16} className="spin" /> : <Mic size={16} />}
+                {recordingCheckBusy ? "检测中" : "检测录音"}
+              </button>
+            </div>
+          </SettingRow>
+        </SettingsPanel>
       ) : null}
 
       {activeSection === "history" ? (

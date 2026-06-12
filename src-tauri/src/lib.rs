@@ -693,7 +693,6 @@ mod macos_input {
     use core_foundation::base::TCFType;
     use core_foundation::boolean::CFBoolean;
     use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
-    use core_foundation::string::CFString as SafeCFString;
     use core_foundation::string::{CFString, CFStringRef};
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
@@ -714,17 +713,6 @@ mod macos_input {
         static kAXTrustedCheckOptionPrompt: CFStringRef;
         fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
         fn AXIsProcessTrusted() -> bool;
-        fn AXUIElementCreateSystemWide() -> *mut AnyObject;
-        fn AXUIElementCopyAttributeValue(
-            element: *mut AnyObject,
-            attribute: CFStringRef,
-            value: *mut *const std::ffi::c_void,
-        ) -> i32;
-        fn AXUIElementSetAttributeValue(
-            element: *mut AnyObject,
-            attribute: CFStringRef,
-            value: *const std::ffi::c_void,
-        ) -> i32;
     }
 
     #[link(name = "AppKit", kind = "framework")]
@@ -797,61 +785,6 @@ mod macos_input {
         false
     }
 
-    pub fn insert_text_into_focused_element(text: &str) -> Result<(), String> {
-        if text.is_empty() {
-            return Ok(());
-        }
-        let system = unsafe { AXUIElementCreateSystemWide() };
-        if system.is_null() {
-            return Err("获取系统辅助功能对象失败".to_string());
-        }
-
-        let focused_attribute = SafeCFString::new("AXFocusedUIElement");
-        let mut focused: *const std::ffi::c_void = std::ptr::null();
-        let focused_status = unsafe {
-            AXUIElementCopyAttributeValue(
-                system,
-                focused_attribute.as_concrete_TypeRef(),
-                &mut focused,
-            )
-        };
-        if focused_status != 0 || focused.is_null() {
-            return Err(format!("获取当前输入焦点失败：AX error {focused_status}"));
-        }
-
-        let selected_text_attribute = SafeCFString::new("AXSelectedText");
-        let value_attribute = SafeCFString::new("AXValue");
-        let selected_text = SafeCFString::new(text);
-        let focused_element = focused as *mut AnyObject;
-        let selected_status = unsafe {
-            AXUIElementSetAttributeValue(
-                focused_element,
-                selected_text_attribute.as_concrete_TypeRef(),
-                selected_text.as_CFTypeRef(),
-            )
-        };
-        if selected_status == 0 {
-            return Ok(());
-        }
-
-        let value_text = SafeCFString::new(text);
-        let value_status = unsafe {
-            AXUIElementSetAttributeValue(
-                focused_element,
-                value_attribute.as_concrete_TypeRef(),
-                value_text.as_CFTypeRef(),
-            )
-        };
-        if value_status == 0 {
-            return Ok(());
-        }
-
-        Err(format!(
-            "辅助功能直接写入失败：selectedText={selected_status}, value={value_status}"
-        ))
-    }
-
-    // 进程内直接发送 Command+V，权限归属当前 app 而非子进程 osascript。
     pub fn send_command_v(target_pid: Option<i32>) -> Result<(), String> {
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| "创建键盘事件源失败".to_string())?;
@@ -1905,10 +1838,9 @@ fn output_text_to_macos_focused_app(text: &str, target_pid: Option<i32>) -> Resu
                 .to_string(),
         ));
     }
-    if macos_input::insert_text_into_focused_element(text).is_ok() {
-        return Ok(());
-    }
-
+    // 统一走剪贴板 + Cmd+V：辅助功能直接写入(AXSelectedText/AXValue)在飞书等
+    // Electron/contenteditable 输入框上行为不可靠（要么静默失败、要么写入成功但
+    // 无法回读校验），与 Cmd+V 兜底叠加会导致重复粘贴。只保留单一可靠机制。
     write_text_to_clipboard(text)?;
     thread::sleep(Duration::from_millis(80));
     paste_clipboard_to_frontmost_app(target_pid)
