@@ -32,6 +32,7 @@ import {
   cancelNativeRecording,
   checkAccessibilityPermission,
   checkFunasrService,
+  checkNativeRecording,
   closeVoiceOverlay,
   clearVoiceHistory,
   copyTextToClipboard,
@@ -87,6 +88,7 @@ const OVERLAY_STATE_EVENT = "voice-overlay-state";
 const OVERLAY_CANCEL_EVENT = "voice-overlay-cancel";
 const RECORD_SHORTCUT_EVENT = "record-shortcut-pressed";
 const RECORD_TRANSCRIBED_EVENT = "record-transcribed";
+const ACTIVE_VOICE_LEVEL = 0.025;
 const DEFAULT_CONFIG: AppConfig = {
   whisper_cli_path: "/usr/local/bin/whisper-cli",
   whisper_model_path: "",
@@ -137,6 +139,9 @@ function MainApp() {
   const [activeSection, setActiveSection] = useState<Section>("home");
   const [configMessage, setConfigMessage] = useState("");
   const [funasrBusy, setFunasrBusy] = useState(false);
+  const [recordingCheckBusy, setRecordingCheckBusy] = useState(false);
+  const [recordingCheckMessage, setRecordingCheckMessage] = useState("");
+  const [recordingCheckOk, setRecordingCheckOk] = useState<boolean>();
   const [shortcutError, setShortcutError] = useState("");
   const [isCapturingShortcut, setIsCapturingShortcut] = useState(false);
   const [modelNameDraft, setModelNameDraft] = useState("");
@@ -939,6 +944,27 @@ function MainApp() {
     }
   }
 
+  async function checkRecording() {
+    setRecordingCheckBusy(true);
+    setRecordingCheckMessage("正在检测录音功能");
+    setError("");
+    try {
+      const health = await checkNativeRecording();
+      setRecordingCheckOk(health.ok);
+      setRecordingCheckMessage(
+        health.ok
+          ? `${health.message}：${health.device || "默认输入设备"} / ${health.sample_rate}Hz / ${health.channels}ch`
+          : health.message
+      );
+    } catch (err) {
+      setRecordingCheckOk(false);
+      setRecordingCheckMessage("");
+      setError(toUserFacingError(err));
+    } finally {
+      setRecordingCheckBusy(false);
+    }
+  }
+
   async function showOverlayState(
     stage: Stage,
     status: string,
@@ -1106,6 +1132,20 @@ function MainApp() {
                 ) : null}
               </div>
             ) : null}
+
+            <div className={recordingCheckOk === false ? "permission-box warning" : "permission-box ok"}>
+              <div className="permission-title">
+                <Mic size={16} />
+                <span>{recordingCheckOk === false ? "录音功能异常" : "录音功能检测"}</span>
+              </div>
+              {recordingCheckMessage ? <p className="permission-message">{recordingCheckMessage}</p> : null}
+              <div className="permission-actions single">
+                <button className="icon-button wide" disabled={recordingCheckBusy || busy} onClick={() => void checkRecording()}>
+                  {recordingCheckBusy ? <Loader2 size={16} className="spin" /> : <Mic size={16} />}
+                  {recordingCheckBusy ? "检测中" : "检测录音"}
+                </button>
+              </div>
+            </div>
           </aside>
 
           <section className="result-panel">
@@ -1484,11 +1524,12 @@ function VoiceOverlayWindow() {
   }, [overlay.stage]);
 
   const level = overlay.level ?? 0;
-  const isActiveVoice = overlay.stage === "recording" && level > 0.08;
+  const isRecording = overlay.stage === "recording";
+  const isActiveVoice = isRecording && level > ACTIVE_VOICE_LEVEL;
   const bars = Array.from({ length: 16 }, (_, index) => {
-    const base = isActiveVoice ? 12 + ((index % 5) + 1) * 3 : 8 + (index % 4) * 2;
-    const wave = isActiveVoice ? Math.abs(Math.sin(index * 0.72 + overlay.seconds * 8.5)) : 0.18;
-    const height = Math.round(base + wave * 22 + level * 26);
+    const base = isRecording ? 10 + ((index % 5) + 1) * 3 : 8 + (index % 4) * 2;
+    const wave = isRecording ? Math.abs(Math.sin(index * 0.72 + overlay.seconds * 8.5)) : 0.18;
+    const height = Math.round(base + wave * (isActiveVoice ? 22 : 10) + level * 34);
     return <span key={index} style={{ height }} />;
   });
 

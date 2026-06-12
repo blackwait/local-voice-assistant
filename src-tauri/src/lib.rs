@@ -37,6 +37,10 @@ const LEGACY_VOICE_TRANSCRIBER_MODEL_DIR: &str =
     "/Users/black/IdeaProjects/voice-transcriber-tauri/models/";
 const RECORDING_STARTUP_TIMEOUT_SECONDS: u64 = 15;
 const MAX_VOICE_HISTORY_ITEMS: usize = 100;
+const ACTIVE_VOICE_LEVEL: f64 = 0.025;
+const MIN_TRANSCRIBE_RMS: f64 = 0.0035;
+const MIN_TRANSCRIBE_PEAK: f32 = 0.018;
+const MIN_TRANSCRIBE_SAMPLES: usize = 1600;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -176,6 +180,15 @@ struct AccessibilityPermissionView {
     platform: String,
 }
 
+#[derive(Debug, Serialize)]
+struct NativeRecordingHealthView {
+    ok: bool,
+    message: String,
+    device: String,
+    sample_rate: u32,
+    channels: u16,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VoiceHistoryItem {
     id: String,
@@ -246,6 +259,20 @@ fn check_accessibility_permission() -> AccessibilityPermissionView {
     AccessibilityPermissionView {
         trusted: accessibility_permission_trusted(),
         platform: env::consts::OS.to_string(),
+    }
+}
+
+#[tauri::command]
+fn check_native_recording() -> NativeRecordingHealthView {
+    match check_native_recording_inner() {
+        Ok(health) => health,
+        Err(error) => NativeRecordingHealthView {
+            ok: false,
+            message: error.to_string(),
+            device: String::new(),
+            sample_rate: 0,
+            channels: 0,
+        },
     }
 }
 
@@ -557,6 +584,29 @@ fn setup_recording_stream(
         .play()
         .map_err(|error| AppError::Audio(error.to_string()))?;
     Ok((stream, samples, sample_rate, started_at))
+}
+
+fn check_native_recording_inner() -> Result<NativeRecordingHealthView, AppError> {
+    ensure_microphone_permission()?;
+
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| AppError::Audio("未找到默认麦克风输入设备".to_string()))?;
+    let device_name = device
+        .name()
+        .unwrap_or_else(|_| "默认麦克风输入设备".to_string());
+    let supported_config = device
+        .default_input_config()
+        .map_err(|error| AppError::Audio(error.to_string()))?;
+
+    Ok(NativeRecordingHealthView {
+        ok: true,
+        message: "录音功能正常".to_string(),
+        device: device_name,
+        sample_rate: supported_config.sample_rate().0,
+        channels: supported_config.channels(),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -887,6 +937,7 @@ fn finish_recording(
     if samples.is_empty() || elapsed_ms < 300 {
         return Err(AppError::Audio("没有采集到有效麦克风音频".to_string()));
     }
+    ensure_voice_audio(&samples, sample_rate)?;
 
     encode_wav(samples, sample_rate)
 }
@@ -1011,7 +1062,7 @@ fn emit_recording_level(app: &AppHandle, started_at: Instant, last_emit: &mut In
             "recording",
             "正在监听语音",
             (started_at.elapsed().as_secs_f64() * 10.0).round() / 10.0,
-            if level > 0.08 {
+            if level > ACTIVE_VOICE_LEVEL {
                 "检测到语音输入"
             } else {
                 "等待说话，按快捷键停止录音"
@@ -1043,6 +1094,46 @@ fn encode_wav(samples: Vec<f32>, sample_rate: u32) -> Result<Vec<u8>, AppError> 
             .map_err(|error| AppError::Audio(error.to_string()))?;
     }
     Ok(cursor.into_inner())
+}
+
+fn ensure_voice_audio(samples: &[f32], sample_rate: u32) -> Result<(), AppError> {
+    let stats = audio_stats(samples);
+    let min_samples = MIN_TRANSCRIBE_SAMPLES.min((sample_rate as usize / 10).max(1));
+    if samples.len() < min_samples
+        || stats.rms < MIN_TRANSCRIBE_RMS
+        || stats.peak < MIN_TRANSCRIBE_PEAK
+    {
+        return Err(AppError::Audio(
+            "没有检测到有效语音，请确认麦克风输入音量后重试".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+struct AudioStats {
+    rms: f64,
+    peak: f32,
+}
+
+fn audio_stats(samples: &[f32]) -> AudioStats {
+    if samples.is_empty() {
+        return AudioStats {
+            rms: 0.0,
+            peak: 0.0,
+        };
+    }
+    let mut sum = 0.0_f64;
+    let mut peak = 0.0_f32;
+    for sample in samples {
+        let value = sample.clamp(-1.0, 1.0);
+        let abs = value.abs();
+        peak = peak.max(abs);
+        sum += (value as f64) * (value as f64);
+    }
+    AudioStats {
+        rms: (sum / samples.len() as f64).sqrt(),
+        peak,
+    }
 }
 
 impl AppConfig {
@@ -2253,11 +2344,36 @@ fn parse_translation_result(content: &str) -> Result<String, AppError> {
 }
 
 fn clean_whisper_text(text: &str) -> String {
-    text.lines()
+    let cleaned = text
+        .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    if is_noise_transcript(&cleaned) {
+        String::new()
+    } else {
+        cleaned
+    }
+}
+
+fn is_noise_transcript(text: &str) -> bool {
+    let compact = text
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    if compact.is_empty() {
+        return true;
+    }
+    let normalized = compact
+        .trim_matches(|ch: char| {
+            ch.is_ascii_punctuation()
+                || matches!(ch, '。' | '，' | '、' | '！' | '？' | '；' | '：')
+        })
+        .to_string();
+    normalized.is_empty()
+        || matches!(normalized.as_str(), "그" | "음" | "嗯" | "呃" | "啊")
+        || normalized.chars().count() <= 1
 }
 
 fn load_dotenv() {
@@ -2344,6 +2460,7 @@ pub fn run() {
             save_config,
             output_text_to_cursor,
             check_accessibility_permission,
+            check_native_recording,
             open_accessibility_settings,
             copy_text_to_clipboard,
             record_voice_history,

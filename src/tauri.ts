@@ -52,6 +52,14 @@ export interface AccessibilityPermissionView {
   platform: string;
 }
 
+export interface NativeRecordingHealthView {
+  ok: boolean;
+  message: string;
+  device: string;
+  sample_rate: number;
+  channels: number;
+}
+
 export interface VoiceHistoryItem {
   id: string;
   text: string;
@@ -115,6 +123,10 @@ export function outputTextToCursor(text: string) {
 
 export function checkAccessibilityPermission() {
   return invoke<AccessibilityPermissionView>("check_accessibility_permission");
+}
+
+export function checkNativeRecording() {
+  return invoke<NativeRecordingHealthView>("check_native_recording");
 }
 
 export function openAccessibilitySettings() {

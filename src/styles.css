@@ -521,6 +521,18 @@ kbd {
   margin-top: 12px;
 }
 
+.permission-actions.single {
+  grid-template-columns: 1fr;
+}
+
+.permission-message {
+  margin: 10px 0 0;
+  color: #59675c;
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
 dl {
   margin: 12px 0 0;
 }
@@ -1131,8 +1143,10 @@ dd {
 }
 
 .voice-overlay-shell[data-stage="recording"] .voice-wave span {
+  opacity: 0.76;
   background: linear-gradient(180deg, rgba(235, 255, 249, 0.72), rgba(94, 234, 212, 0.28));
-  animation: none;
+  animation: rolling-wave 980ms ease-in-out infinite;
+  transform: scaleY(1.02);
 }
 
 .voice-overlay-shell[data-stage="recording"][data-active-voice="true"] .voice-wave span {
