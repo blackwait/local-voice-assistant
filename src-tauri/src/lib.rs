@@ -5,19 +5,13 @@ use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::io::Cursor;
-#[cfg(any(
-    target_os = "macos",
-    all(not(target_os = "macos"), not(target_os = "windows"))
-))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process;
 use std::process::Command;
-#[cfg(any(
-    target_os = "macos",
-    all(not(target_os = "macos"), not(target_os = "windows"))
-))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 use std::process::Stdio;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -698,6 +692,7 @@ mod macos_input {
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use objc2::msg_send;
     use objc2::runtime::{AnyClass, AnyObject, Bool};
+    use objc2_foundation::NSString;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -720,6 +715,27 @@ mod macos_input {
 
     pub fn accessibility_trusted() -> bool {
         unsafe { AXIsProcessTrusted() }
+    }
+
+    // 进程内通过 NSPasteboard 写系统剪贴板，避免依赖 pbcopy 子进程。
+    // pbcopy 在打包后的 GUI app 里存在 PATH、stdin EOF、子进程环境等不确定因素，
+    // 容易出现“返回成功但剪贴板实际为空”的情况。
+    pub fn write_clipboard(text: &str) -> Result<(), String> {
+        let pasteboard_class =
+            AnyClass::get(c"NSPasteboard").ok_or_else(|| "NSPasteboard 类不可用".to_string())?;
+        let pasteboard: *mut AnyObject = unsafe { msg_send![pasteboard_class, generalPasteboard] };
+        if pasteboard.is_null() {
+            return Err("获取系统剪贴板失败".to_string());
+        }
+        let ns_text = NSString::from_str(text);
+        let ns_type = NSString::from_str("public.utf8-plain-text");
+        let _: i64 = unsafe { msg_send![pasteboard, clearContents] };
+        let ok: Bool = unsafe { msg_send![pasteboard, setString: &*ns_text, forType: &*ns_type] };
+        if ok.as_bool() {
+            Ok(())
+        } else {
+            Err("写入系统剪贴板失败".to_string())
+        }
     }
 
     // 触发系统辅助功能授权引导框，并把当前 app 加入辅助功能列表。
@@ -1784,22 +1800,8 @@ fn output_text_to_cursor_inner(app: &AppHandle, text: String) -> Result<(), AppE
 
 #[cfg(target_os = "macos")]
 fn write_text_to_clipboard(text: &str) -> Result<(), AppError> {
-    let mut child = Command::new("pbcopy")
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|error| AppError::Output(format!("写入剪贴板失败：{error}")))?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(|error| AppError::Output(format!("写入剪贴板失败：{error}")))?;
-    }
-    let status = child
-        .wait()
-        .map_err(|error| AppError::Output(format!("等待剪贴板写入失败：{error}")))?;
-    if !status.success() {
-        return Err(AppError::Output(format!("pbcopy 退出异常：{status}")));
-    }
-    Ok(())
+    macos_input::write_clipboard(text)
+        .map_err(|error| AppError::Output(format!("写入剪贴板失败：{error}")))
 }
 
 #[cfg(target_os = "windows")]
