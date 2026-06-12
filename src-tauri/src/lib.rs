@@ -1301,17 +1301,18 @@ fn transcribe_recording_from_hotkey(app: AppHandle) {
         "正在处理录音",
         0.28,
     );
-    let result = (|| -> Result<String, String> {
+    let result = (|| -> Result<(AppConfig, String), String> {
         let config = load_or_create_config(&app)?;
         let state = app
             .try_state::<RecorderState>()
             .ok_or_else(|| "录音状态未初始化".to_string())?;
         let audio = stop_recording(&state).map_err(|error| error.to_string())?;
-        transcribe_audio(audio, &config).map_err(|error| error.to_string())
+        let text = transcribe_audio(audio, &config).map_err(|error| error.to_string())?;
+        Ok((config, text))
     })();
     let transcribe_seconds = (started_at.elapsed().as_secs_f64() * 10.0).round() / 10.0;
     match result {
-        Ok(text) => {
+        Ok((config, text)) => {
             emit_overlay_state(
                 &app,
                 "recognized",
@@ -1320,27 +1321,204 @@ fn transcribe_recording_from_hotkey(app: AppHandle) {
                 "正在准备 AI 处理",
                 0.05,
             );
-            let _ = app.emit(
-                RECORD_TRANSCRIBED_EVENT,
-                json!({
-                    "ok": true,
-                    "text": text,
-                    "transcribeSeconds": transcribe_seconds
-                }),
-            );
+            if let Err(error) =
+                process_hotkey_transcription(&app, text, config, started_at, transcribe_seconds)
+            {
+                let seconds = elapsed_tenths(started_at);
+                emit_overlay_state(&app, "error", "处理失败", seconds, &error, 0.1);
+                emit_hotkey_task_finished(
+                    &app,
+                    json!({
+                        "ok": false,
+                        "processed": true,
+                        "error": error,
+                        "transcribeSeconds": transcribe_seconds
+                    }),
+                );
+            }
         }
         Err(error) => {
             emit_overlay_state(&app, "error", "处理失败", transcribe_seconds, &error, 0.1);
-            let _ = app.emit(
-                RECORD_TRANSCRIBED_EVENT,
+            emit_hotkey_task_finished(
+                &app,
                 json!({
                     "ok": false,
+                    "processed": true,
                     "error": error,
                     "transcribeSeconds": transcribe_seconds
                 }),
             );
         }
     }
+}
+
+fn process_hotkey_transcription(
+    app: &AppHandle,
+    text: String,
+    config: AppConfig,
+    started_at: Instant,
+    transcribe_seconds: f64,
+) -> Result<(), String> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("识别结果为空，请重新录音。".to_string());
+    }
+
+    if !deepseek_configured(&config) {
+        let result = AssistantResult {
+            corrected_text: text.clone(),
+            translation: String::new(),
+            notes: vec![format!(
+                "未配置 DeepSeek，已输出 {} 转写文本。",
+                asr_engine_name(&config)
+            )],
+            confidence: "medium".to_string(),
+        };
+        output_hotkey_final_text(app, &result.corrected_text)?;
+        let seconds = elapsed_tenths(started_at);
+        emit_overlay_state(
+            app,
+            "done",
+            "已输出到光标位置",
+            seconds,
+            &preview_overlay_text(&result.corrected_text),
+            0.1,
+        );
+        emit_hotkey_task_finished(
+            app,
+            json!({
+                "ok": true,
+                "processed": true,
+                "text": text,
+                "result": result,
+                "transcribeSeconds": transcribe_seconds
+            }),
+        );
+        return Ok(());
+    }
+
+    emit_overlay_state(
+        app,
+        "polishing",
+        "AI 正在润色",
+        transcribe_seconds,
+        "正在润色文本、整理断句和标点",
+        0.45,
+    );
+    let correction_started_at = Instant::now();
+    let correction = tauri::async_runtime::block_on(call_deepseek_correction(&text, &config))
+        .map_err(|error| error.to_string())?;
+    let correction_seconds = elapsed_tenths(correction_started_at);
+
+    let translation = if config.translation_enabled {
+        emit_overlay_state(
+            app,
+            "translating",
+            "实时翻译中",
+            correction_seconds,
+            &format!("正在翻译为{}", config.target_language),
+            0.5,
+        );
+        let translation_started_at = Instant::now();
+        let translation = tauri::async_runtime::block_on(call_deepseek_translation(
+            &correction.corrected_text,
+            config.target_language.as_str(),
+            &config,
+        ))
+        .map_err(|error| error.to_string())?;
+        Some((translation, elapsed_tenths(translation_started_at)))
+    } else {
+        None
+    };
+
+    output_hotkey_final_text(app, &correction.corrected_text)?;
+    let total_seconds = elapsed_tenths(started_at);
+    emit_overlay_state(
+        app,
+        "done",
+        "已输出到光标位置",
+        total_seconds,
+        &preview_overlay_text(&correction.corrected_text),
+        0.1,
+    );
+
+    let (translation_text, translation_seconds) =
+        translation.unwrap_or_else(|| (String::new(), 0.0));
+    let result = AssistantResult {
+        corrected_text: correction.corrected_text,
+        translation: translation_text,
+        notes: correction.notes,
+        confidence: correction.confidence,
+    };
+    let mut payload = json!({
+        "ok": true,
+        "processed": true,
+        "text": text,
+        "result": result,
+        "transcribeSeconds": transcribe_seconds,
+        "correctionSeconds": correction_seconds
+    });
+    if config.translation_enabled {
+        payload["translationSeconds"] = json!(translation_seconds);
+    }
+    emit_hotkey_task_finished(app, payload);
+    Ok(())
+}
+
+fn output_hotkey_final_text(app: &AppHandle, text: &str) -> Result<(), String> {
+    if let Err(error) = record_voice_history_inner(app, text.to_string()) {
+        eprintln!("voice history save failed: {error}");
+    }
+    output_text_to_cursor_inner(app, text.to_string()).map_err(|error| {
+        format!(
+            "{}。文本已尽量写入剪贴板，可手动 {} 粘贴。",
+            error,
+            manual_paste_shortcut()
+        )
+    })
+}
+
+fn emit_hotkey_task_finished(app: &AppHandle, payload: Value) {
+    let _ = app.emit(RECORD_TRANSCRIBED_EVENT, payload);
+}
+
+fn elapsed_tenths(started_at: Instant) -> f64 {
+    (started_at.elapsed().as_secs_f64() * 10.0).round() / 10.0
+}
+
+fn deepseek_configured(config: &AppConfig) -> bool {
+    is_configured_secret(&config.deepseek_api_key)
+        || !normalize_endpoint(config.deepseek_endpoint.trim()).is_empty()
+}
+
+fn asr_engine_name(config: &AppConfig) -> &'static str {
+    if config.asr_engine.trim().eq_ignore_ascii_case("funasr") {
+        "FunASR"
+    } else {
+        "Whisper"
+    }
+}
+
+fn preview_overlay_text(text: &str) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return "处理完成".to_string();
+    }
+    let mut preview = compact.chars().take(34).collect::<String>();
+    if compact.chars().count() > 34 {
+        preview.push_str("...");
+    }
+    preview
+}
+
+#[cfg(target_os = "macos")]
+fn manual_paste_shortcut() -> &'static str {
+    "Command+V"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn manual_paste_shortcut() -> &'static str {
+    "Ctrl+V"
 }
 
 fn is_recording(app: &AppHandle) -> bool {

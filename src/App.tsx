@@ -69,9 +69,13 @@ type ShortcutPayload = {
 };
 type TranscribedPayload = {
   ok: boolean;
+  processed?: boolean;
   text?: string;
+  result?: AssistantResult;
   error?: string;
   transcribeSeconds?: number;
+  correctionSeconds?: number;
+  translationSeconds?: number;
 };
 
 const MAX_SECONDS = 60;
@@ -445,6 +449,10 @@ function MainApp() {
   }
 
   async function handleTranscribedPayload(payload: TranscribedPayload) {
+    if (payload.processed) {
+      handleProcessedHotkeyPayload(payload);
+      return;
+    }
     clearTimer();
     recordingStartedAtRef.current = undefined;
     if (voiceInputCanceledRef.current) {
@@ -476,6 +484,41 @@ function MainApp() {
       scheduleOverlayHide();
     } finally {
       clearProcessingTimer();
+    }
+  }
+
+  function handleProcessedHotkeyPayload(payload: TranscribedPayload) {
+    clearTimer();
+    clearProcessingTimer();
+    recordingStartedAtRef.current = undefined;
+    if (voiceInputCanceledRef.current) {
+      return;
+    }
+    setTranscribeSeconds(payload.transcribeSeconds);
+    setCorrectionSeconds(payload.correctionSeconds);
+    setTranslationSeconds(payload.translationSeconds);
+    if (!payload.ok) {
+      transitionStage("error");
+      const message = payload.error || "处理失败";
+      setError(message);
+      return;
+    }
+    const text = (payload.text || "").trim();
+    const finalResult =
+      payload.result ||
+      ({
+        corrected_text: text,
+        translation: "",
+        notes: [],
+        confidence: "medium"
+      } satisfies AssistantResult);
+    setError("");
+    setTranscript(text);
+    setResult(finalResult);
+    transitionStage("done");
+    void refreshAccessibilityStatus();
+    if (activeSection === "history") {
+      void refreshHistory();
     }
   }
 
