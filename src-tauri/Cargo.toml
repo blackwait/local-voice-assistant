@@ -1,6 +1,6 @@
 [package]
 name = "local-voice-assistant"
-version = "0.1.22"
+version = "0.1.23"
 description = "A local-first voice assistant built with Tauri"
 authors = ["black"]
 edition = "2021"

@@ -21,6 +21,7 @@ import {
   X
 } from "lucide-react";
 import { emitTo, listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow, Window } from "@tauri-apps/api/window";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -154,6 +155,7 @@ function MainApp() {
   const [targetLanguage, setTargetLanguage] = useState("中文");
   const [result, setResult] = useState<AssistantResult>();
   const [accessibilityStatus, setAccessibilityStatus] = useState<AccessibilityPermissionView>();
+  const [appVersion, setAppVersion] = useState("");
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -166,6 +168,9 @@ function MainApp() {
       })
       .catch((err) => setError(toUserFacingError(err)));
     void refreshAccessibilityStatus();
+    void getVersion()
+      .then(setAppVersion)
+      .catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -1023,7 +1028,10 @@ function MainApp() {
       <section className="hero-band">
         <div>
           <p className="eyebrow">语音输入 · AI 润色</p>
-          <h1>鱼泡语音助手</h1>
+          <h1>
+            鱼泡语音助手
+            {appVersion ? <span className="app-version">v{appVersion}</span> : null}
+          </h1>
         </div>
         <div className="status-strip">
           <StatusDot ok={Boolean(config?.funasr_endpoint)} label="FunASR 服务" />
