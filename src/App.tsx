@@ -102,8 +102,10 @@ const DEFAULT_CONFIG: AppConfig = {
   deepseek_api_key: "sk-5ccffb5099bb43cc9e98d85386b25cec",
   deepseek_model: "deepseek-v4-flash",
   deepseek_endpoint: "http://10.254.81.32:10095",
+  llm_base_url: "",
   deepseek_key_configured: true,
   translation_enabled: false,
+  polish_enabled: true,
   target_language: "中文",
   config_path: "",
   record_shortcut: "CommandOrControl+1",
@@ -1432,6 +1434,16 @@ function MainApp() {
               placeholder="http://10.254.81.32:10095"
             />
           </SettingRow>
+          <SettingRow title="AI 润色" desc="关闭后直接将识别原文输出到光标，零 LLM 延迟；翻译仍可独立开启">
+            <label className="switch-row">
+              <input
+                type="checkbox"
+                checked={config.polish_enabled}
+                onChange={(event) => updateConfig({ polish_enabled: event.target.checked })}
+              />
+              <span>{config.polish_enabled ? "已启用" : "已关闭（直接输出识别原文）"}</span>
+            </label>
+          </SettingRow>
           <SettingRow title="实时翻译" desc="关闭后只进行 AI 润色，不再调用翻译接口">
             <label className="switch-row">
               <input
@@ -1486,6 +1498,13 @@ function MainApp() {
               <option value="日文">日文</option>
               <option value="韩文">韩文</option>
             </select>
+          </SettingRow>
+          <SettingRow title="LLM 服务地址" desc="留空时使用 DeepSeek 官方；填写后走任意 OpenAI 兼容服务（GLM-4-Flash / Qwen / Ollama / vLLM）">
+            <input
+              value={config.llm_base_url}
+              onChange={(event) => updateConfig({ llm_base_url: event.target.value })}
+              placeholder="https://open.bigmodel.cn/api/paas/v4"
+            />
           </SettingRow>
           <SettingRow title="保存 AI 设置" desc={config.deepseek_endpoint ? "使用服务端 DeepSeek 代理" : config.deepseek_key_configured ? "DeepSeek key 已配置" : "DeepSeek key 未配置"}>
             <button className="primary" onClick={() => void persistConfig()}>

@@ -12,8 +12,10 @@ export interface AppConfig {
   deepseek_api_key: string;
   deepseek_model: string;
   deepseek_endpoint: string;
+  llm_base_url: string;
   deepseek_key_configured: boolean;
   translation_enabled: boolean;
+  polish_enabled: boolean;
   target_language: string;
   config_path: string;
   record_shortcut: string;

@@ -68,8 +68,15 @@ struct AppConfig {
     deepseek_api_key: String,
     deepseek_model: String,
     deepseek_endpoint: String,
+    /// 自定义 LLM 服务的 OpenAI 兼容 base URL（不含 /chat/completions）。
+    /// 留空时回退到 DeepSeek 官方 https://api.deepseek.com/chat/completions。
+    /// 填写后可指向 GLM-4-Flash、通义千问、Ollama、本地 vLLM 等。
+    llm_base_url: String,
     #[serde(default = "default_translation_enabled")]
     translation_enabled: bool,
+    /// 是否启用 AI 润色。关闭后直接将转写原文输出到光标（仍可继续走翻译）。
+    #[serde(default = "default_polish_enabled")]
+    polish_enabled: bool,
     target_language: String,
     record_shortcut: String,
     shortcut_enabled: bool,
@@ -114,7 +121,9 @@ impl Default for AppConfig {
                 .unwrap_or_else(|_| "deepseek-v4-flash".to_string()),
             deepseek_endpoint: env::var("DEEPSEEK_ENDPOINT")
                 .unwrap_or_else(|_| "http://10.254.81.32:10095".to_string()),
+            llm_base_url: env::var("LLM_BASE_URL").unwrap_or_else(|_| "".to_string()),
             translation_enabled: default_translation_enabled(),
+            polish_enabled: default_polish_enabled(),
             target_language: "中文".to_string(),
             record_shortcut: default_record_shortcut(),
             shortcut_enabled: true,
@@ -136,8 +145,10 @@ struct AppConfigView {
     deepseek_api_key: String,
     deepseek_model: String,
     deepseek_endpoint: String,
+    llm_base_url: String,
     deepseek_key_configured: bool,
     translation_enabled: bool,
+    polish_enabled: bool,
     target_language: String,
     config_path: String,
     record_shortcut: String,
@@ -1165,9 +1176,11 @@ impl AppConfig {
             deepseek_api_key: self.deepseek_api_key.clone(),
             deepseek_model: self.deepseek_model.clone(),
             deepseek_endpoint: self.deepseek_endpoint.clone(),
+            llm_base_url: self.llm_base_url.clone(),
             deepseek_key_configured: is_configured_secret(&self.deepseek_api_key)
                 || !normalize_endpoint(&self.deepseek_endpoint).is_empty(),
             translation_enabled: self.translation_enabled,
+            polish_enabled: self.polish_enabled,
             target_language: self.target_language.clone(),
             config_path: config_path.display().to_string(),
             record_shortcut: self.record_shortcut.clone(),
@@ -1209,10 +1222,13 @@ fn normalize_config(_app: &AppHandle, config: &mut AppConfig) {
     if config.funasr_device.trim().is_empty() {
         config.funasr_device = "cpu".to_string();
     }
-    if config.deepseek_endpoint.trim().is_empty() && config.deepseek_api_key.trim().is_empty() {
+    if config.deepseek_endpoint.trim().is_empty()
+        && config.deepseek_api_key.trim().is_empty()
+        && config.llm_base_url.trim().is_empty()
+    {
         config.deepseek_endpoint = "http://10.254.81.32:10095".to_string();
     }
-    if config.deepseek_api_key.trim().is_empty() {
+    if config.deepseek_api_key.trim().is_empty() && config.llm_base_url.trim().is_empty() {
         config.deepseek_api_key = DEFAULT_DEEPSEEK_API_KEY.to_string();
     }
     config
@@ -1470,14 +1486,25 @@ fn process_hotkey_transcription(
         return Err("识别结果为空，请重新录音。".to_string());
     }
 
-    if !deepseek_configured(&config) {
+    if !deepseek_configured(&config) || !config.polish_enabled {
+        let (skip_reason, notes_text): (&str, String) = if !config.polish_enabled {
+            (
+                "已跳过 AI 润色，输出原始识别文本。",
+                "已关闭 AI 润色，输出识别原文。".to_string(),
+            )
+        } else {
+            (
+                "未配置 DeepSeek，已输出转写文本。",
+                format!(
+                    "未配置 DeepSeek，已输出 {} 转写文本。",
+                    asr_engine_name(&config)
+                ),
+            )
+        };
         let result = AssistantResult {
             corrected_text: text.clone(),
             translation: String::new(),
-            notes: vec![format!(
-                "未配置 DeepSeek，已输出 {} 转写文本。",
-                asr_engine_name(&config)
-            )],
+            notes: vec![notes_text],
             confidence: "medium".to_string(),
         };
         output_hotkey_final_text(app, &result.corrected_text)?;
@@ -1497,6 +1524,7 @@ fn process_hotkey_transcription(
                 "processed": true,
                 "text": text,
                 "result": result,
+                "skipReason": skip_reason,
                 "transcribeSeconds": transcribe_seconds
             }),
         );
@@ -2064,6 +2092,18 @@ fn normalize_endpoint(endpoint: &str) -> String {
     endpoint.trim().trim_end_matches('/').to_string()
 }
 
+/// 解析 LLM 调用的完整 chat/completions URL。
+/// - 若 `llm_base_url` 非空，则拼接 `{base}/chat/completions`；
+/// - 否则回退到 DeepSeek 官方 `https://api.deepseek.com/chat/completions`。
+fn llm_chat_url(config: &AppConfig) -> String {
+    let base = config.llm_base_url.trim();
+    if base.is_empty() {
+        return "https://api.deepseek.com/chat/completions".to_string();
+    }
+    let trimmed = base.trim_end_matches('/');
+    format!("{trimmed}/chat/completions")
+}
+
 fn parse_funasr_endpoint(endpoint: &str) -> (String, String) {
     let endpoint = endpoint
         .trim()
@@ -2125,7 +2165,7 @@ async fn call_deepseek_correction(
     });
 
     let response = Client::new()
-        .post("https://api.deepseek.com/chat/completions")
+        .post(llm_chat_url(config))
         .bearer_auth(api_key.to_string())
         .json(&payload)
         .send()
@@ -2190,7 +2230,7 @@ async fn call_deepseek_translation(
     });
 
     let response = Client::new()
-        .post("https://api.deepseek.com/chat/completions")
+        .post(llm_chat_url(config))
         .bearer_auth(api_key.to_string())
         .json(&payload)
         .send()
@@ -2406,6 +2446,14 @@ fn default_record_shortcut() -> String {
 
 fn default_translation_enabled() -> bool {
     false
+}
+
+fn default_polish_enabled() -> bool {
+    // 默认开启 AI 润色，保留历史行为；可通过 .env 的 POLISH_ENABLED=0 关闭。
+    env::var("POLISH_ENABLED")
+        .ok()
+        .map(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off" | ""))
+        .unwrap_or(true)
 }
 
 fn default_whisper_model_path() -> String {
