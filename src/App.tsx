@@ -97,7 +97,7 @@ const DEFAULT_CONFIG: AppConfig = {
   whisper_threads: "8",
   asr_engine: "funasr",
   funasr_endpoint: "http://10.254.81.32:10095",
-  funasr_model: "iic/SenseVoiceSmall",
+  funasr_model: "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
   funasr_device: "cpu",
   deepseek_api_key: "sk-5ccffb5099bb43cc9e98d85386b25cec",
   deepseek_model: "deepseek-v4-flash",
@@ -1276,13 +1276,13 @@ function MainApp() {
           <SettingRow title="识别引擎" desc="FunASR 走 HTTP 服务；Whisper 需要自行安装 whisper.cpp 和 ggml 模型">
             <select value={config.asr_engine} onChange={(event) => updateConfig({ asr_engine: event.target.value })}>
               <option value="whisper">Whisper 本地模型</option>
-              <option value="funasr">FunASR / SenseVoice</option>
+              <option value="funasr">FunASR / Paraformer</option>
             </select>
           </SettingRow>
 
           {config.asr_engine === "funasr" ? (
             <>
-              <SettingRow title="FunASR 服务" desc="默认使用当前服务模型；云端地址直接检测服务">
+              <SettingRow title="FunASR 服务" desc="默认优先使用远端 10.254.81.32:10095，失败时自动回退到本机 127.0.0.1:10095">
                 <div className="service-actions">
                   <button className="primary" disabled={funasrBusy} onClick={() => void startFunasr()}>
                     {funasrBusy ? <Loader2 size={16} className="spin" /> : <Server size={16} />}
@@ -1293,10 +1293,10 @@ function MainApp() {
                   </button>
                 </div>
               </SettingRow>
-              <SettingRow title="服务地址" desc="默认使用当前 10095 服务；也可填写其他 FunASR 服务地址">
+              <SettingRow title="服务地址" desc="默认填写远端地址；代码会先试这里，失败后自动回退本机 127.0.0.1:10095">
                 <input value={config.funasr_endpoint} onChange={(event) => updateConfig({ funasr_endpoint: event.target.value })} />
               </SettingRow>
-              <SettingRow title="FunASR 模型" desc="默认 SenseVoiceSmall；可换成已支持的 ModelScope 模型名或本地路径">
+              <SettingRow title="FunASR 模型" desc="默认 Paraformer-large；可换成已支持的 ModelScope 模型名或本地路径">
                 <input value={config.funasr_model} onChange={(event) => updateConfig({ funasr_model: event.target.value })} />
               </SettingRow>
               <SettingRow title="推理设备" desc="CPU 默认可用；有可用环境时可改为 cuda">

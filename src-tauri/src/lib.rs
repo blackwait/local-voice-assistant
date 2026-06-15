@@ -35,6 +35,9 @@ const ACTIVE_VOICE_LEVEL: f64 = 0.025;
 const MIN_TRANSCRIBE_RMS: f64 = 0.0035;
 const MIN_TRANSCRIBE_PEAK: f32 = 0.018;
 const MIN_TRANSCRIBE_SAMPLES: usize = 1600;
+const DEFAULT_FUNASR_REMOTE_ENDPOINT: &str = "http://10.254.81.32:10095";
+const DEFAULT_FUNASR_LOCAL_ENDPOINT: &str = "http://127.0.0.1:10095";
+const FUNASR_REQUEST_TIMEOUT_SECONDS: u64 = 8;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -112,8 +115,10 @@ impl Default for AppConfig {
             whisper_threads: env::var("WHISPER_THREADS").unwrap_or_else(|_| "8".to_string()),
             asr_engine: env::var("ASR_ENGINE").unwrap_or_else(|_| "funasr".to_string()),
             funasr_endpoint: env::var("FUNASR_ENDPOINT")
-                .unwrap_or_else(|_| "http://10.254.81.32:10095".to_string()),
-            funasr_model: "iic/SenseVoiceSmall".to_string(),
+                .unwrap_or_else(|_| DEFAULT_FUNASR_REMOTE_ENDPOINT.to_string()),
+            funasr_model:
+                "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
+                    .to_string(),
             funasr_device: "cpu".to_string(),
             deepseek_api_key: env::var("DEEPSEEK_API_KEY")
                 .unwrap_or_else(|_| DEFAULT_DEEPSEEK_API_KEY.to_string()),
@@ -1214,10 +1219,12 @@ fn normalize_config(_app: &AppHandle, config: &mut AppConfig) {
         config.polish_prompt = build_correction_prompt();
     }
     if config.funasr_endpoint.trim().is_empty() {
-        config.funasr_endpoint = "http://10.254.81.32:10095".to_string();
+        config.funasr_endpoint = DEFAULT_FUNASR_REMOTE_ENDPOINT.to_string();
     }
     if config.funasr_model.trim().is_empty() {
-        config.funasr_model = "iic/SenseVoiceSmall".to_string();
+        config.funasr_model =
+            "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
+                .to_string();
     }
     if config.funasr_device.trim().is_empty() {
         config.funasr_device = "cpu".to_string();
@@ -2014,8 +2021,8 @@ fn transcribe_with_whisper(audio: Vec<u8>, config: &AppConfig) -> Result<String,
 }
 
 fn transcribe_with_funasr(audio: Vec<u8>, config: &AppConfig) -> Result<String, AppError> {
-    let endpoint = normalize_endpoint(config.funasr_endpoint.trim());
-    if endpoint.is_empty() {
+    let endpoints = funasr_endpoints_to_try(config.funasr_endpoint.trim());
+    if endpoints.is_empty() {
         return Err(AppError::WhisperFailed(
             "请先配置 FunASR 服务地址".to_string(),
         ));
@@ -2027,69 +2034,116 @@ fn transcribe_with_funasr(audio: Vec<u8>, config: &AppConfig) -> Result<String, 
     let audio_path = temp_dir.path().join("input.wav");
     fs::write(&audio_path, audio).map_err(|error| AppError::Io(error.to_string()))?;
 
-    let form = reqwest::blocking::multipart::Form::new()
-        .file("file", &audio_path)
-        .map_err(|error| AppError::Io(error.to_string()))?;
-    let response = reqwest::blocking::Client::new()
-        .post(format!("{endpoint}/transcribe"))
-        .multipart(form)
-        .send()
-        .map_err(|error| AppError::WhisperFailed(format!("FunASR 服务请求失败：{error}")))?;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(FUNASR_REQUEST_TIMEOUT_SECONDS))
+        .build()
+        .map_err(|error| AppError::WhisperFailed(format!("创建 FunASR 客户端失败：{error}")))?;
+    let mut last_error = String::new();
+    for endpoint in endpoints {
+        let form = reqwest::blocking::multipart::Form::new()
+            .file("file", &audio_path)
+            .map_err(|error| AppError::Io(error.to_string()))?;
+        let response = match client
+            .post(format!("{endpoint}/transcribe"))
+            .multipart(form)
+            .send()
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("{endpoint} 请求失败：{error}");
+                continue;
+            }
+        };
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        return Err(AppError::WhisperFailed(format!(
-            "FunASR 服务返回错误：{status} {body}"
-        )));
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            last_error = format!("{endpoint} 返回错误：{status} {body}");
+            continue;
+        }
+        let data = match response.json::<Value>() {
+            Ok(data) => data,
+            Err(error) => {
+                last_error = format!("{endpoint} 返回结果解析失败：{error}");
+                continue;
+            }
+        };
+        let text = data
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            last_error = format!("{endpoint} 未返回识别文本");
+            continue;
+        }
+        return Ok(clean_whisper_text(&text));
     }
-    let data = response
-        .json::<Value>()
-        .map_err(|error| AppError::WhisperFailed(error.to_string()))?;
-    let text = data
-        .get("text")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if text.is_empty() {
-        return Err(AppError::WhisperFailed("FunASR 未返回识别文本".to_string()));
-    }
-    Ok(clean_whisper_text(&text))
+    Err(AppError::WhisperFailed(format!(
+        "FunASR 服务请求失败，已按顺序尝试远端和本地地址：{last_error}"
+    )))
 }
 
 async fn check_funasr_health(config: &AppConfig) -> Result<FunAsrHealthView, String> {
-    let endpoint = normalize_endpoint(config.funasr_endpoint.trim());
-    let response = Client::new()
-        .get(format!("{endpoint}/health"))
-        .send()
-        .await
-        .map_err(|error| format!("FunASR 服务不可用：{error}"))?;
-    if !response.status().is_success() {
-        return Err(format!("FunASR 服务异常：{}", response.status()));
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(FUNASR_REQUEST_TIMEOUT_SECONDS))
+        .build()
+        .map_err(|error| format!("创建 FunASR 客户端失败：{error}"))?;
+    let mut last_error = String::new();
+    for endpoint in funasr_endpoints_to_try(config.funasr_endpoint.trim()) {
+        let response = match client.get(format!("{endpoint}/health")).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("{endpoint} 不可用：{error}");
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            last_error = format!("{endpoint} 异常：{}", response.status());
+            continue;
+        }
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(FunAsrHealthView {
+            ok: value.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            message: format!("FunASR 服务可用：{endpoint}"),
+            model: value
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            device: value
+                .get("device")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
     }
-    let value = response
-        .json::<Value>()
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(FunAsrHealthView {
-        ok: value.get("ok").and_then(Value::as_bool).unwrap_or(false),
-        message: "FunASR 服务可用".to_string(),
-        model: value
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        device: value
-            .get("device")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-    })
+    Err(format!(
+        "FunASR 服务不可用，已按顺序尝试远端和本地地址：{last_error}"
+    ))
 }
 
 fn normalize_endpoint(endpoint: &str) -> String {
     endpoint.trim().trim_end_matches('/').to_string()
+}
+
+fn funasr_endpoints_to_try(endpoint: &str) -> Vec<String> {
+    let mut endpoints = Vec::new();
+    let preferred = normalize_endpoint(endpoint);
+    if !preferred.is_empty() {
+        endpoints.push(preferred);
+    }
+    let local = DEFAULT_FUNASR_LOCAL_ENDPOINT.to_string();
+    if !endpoints.iter().any(|value| value == &local) {
+        endpoints.push(local);
+    }
+    endpoints
 }
 
 /// 解析 LLM 调用的完整 chat/completions URL。

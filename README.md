@@ -3,23 +3,30 @@
 本项目是一个 Tauri 桌面语音助手：
 
 - 录音输入最大 60 秒。
-- 语音识别默认使用 FunASR 服务。
+- 语音识别默认使用 FunASR 服务，优先远端，失败自动回退本地。
 - 安装包不内置 Whisper / ggml 本地模型。
 - 识别完成后，把文本发送给 DeepSeek 做 AI 润色和实时翻译。
 - DeepSeek key 只在 Rust 后端读取，不写入前端代码。
 
 ## 默认识别方式
 
-默认配置使用当前 FunASR 服务：
+默认配置优先使用远端 FunASR Paraformer-large 服务；远端不可用时自动回退本机服务：
 
 ```text
 ASR_ENGINE=funasr
 FUNASR_ENDPOINT=http://10.254.81.32:10095
-FUNASR_MODEL=iic/SenseVoiceSmall
+FUNASR_MODEL=iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch
 FUNASR_DEVICE=cpu
 ```
 
-GitHub release 不会下载或打包 `models/ggml-tiny.bin`。同事安装后默认直接调用 FunASR 服务，不需要本机准备 Whisper 模型。
+代码中的默认顺序是：
+
+```text
+1. 先请求 FUNASR_ENDPOINT（默认 http://10.254.81.32:10095）
+2. 如果失败，再自动回退到 http://127.0.0.1:10095
+```
+
+GitHub release 不会下载或打包 `models/ggml-tiny.bin`。同事安装后默认直接调用远端或本机的 FunASR 服务，不需要本机准备 Whisper 模型。
 
 ## 可选：本地 Whisper 模型
 
