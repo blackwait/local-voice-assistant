@@ -11,6 +11,8 @@ use crate::AppError;
 
 const MAX_USAGE_EVENTS: usize = 2000;
 const DEFAULT_TYPING_SPEED_CPM: u32 = 28;
+const MIN_TYPING_SPEED_CPM: u32 = 20;
+const MAX_TYPING_SPEED_CPM: u32 = 100;
 const SAVINGS_CREDIT_RATIO: f64 = 0.7;
 const MAX_SAVED_SECONDS_PER_SESSION: f64 = 120.0;
 const MIN_CHARS_FOR_SAVINGS: u32 = 8;
@@ -126,6 +128,10 @@ pub fn default_typing_speed_cpm() -> u32 {
     DEFAULT_TYPING_SPEED_CPM
 }
 
+pub fn clamp_typing_speed_cpm(value: u32) -> u32 {
+    value.clamp(MIN_TYPING_SPEED_CPM, MAX_TYPING_SPEED_CPM)
+}
+
 pub fn wav_duration_seconds(audio: &[u8]) -> f64 {
     let cursor = std::io::Cursor::new(audio);
     let reader = match hound::WavReader::new(cursor) {
@@ -147,7 +153,7 @@ pub fn estimate_typing_seconds(char_count: u32, typing_speed_cpm: u32) -> f64 {
     if char_count < MIN_CHARS_FOR_SAVINGS {
         return 0.0;
     }
-    let cpm = typing_speed_cpm.max(20) as f64;
+    let cpm = clamp_typing_speed_cpm(typing_speed_cpm) as f64;
     round_tenths((char_count as f64 / cpm) * 60.0)
 }
 
@@ -200,7 +206,7 @@ pub fn record_usage_event_inner(
     }
 
     let char_count = count_typing_chars(text);
-    let typing_speed_cpm = config.typing_speed_cpm.max(20);
+    let typing_speed_cpm = clamp_typing_speed_cpm(config.typing_speed_cpm);
     let (estimated_typing_seconds, saved_seconds) = compute_saved_seconds(
         char_count,
         metrics.recording_seconds,
@@ -247,7 +253,7 @@ pub fn get_usage_stats_summary(app: &AppHandle, config: &AppConfig) -> Result<Us
     let month_start = today_start.saturating_sub(29 * 24 * 60 * 60 * 1000);
 
     let mut summary = UsageStatsSummary {
-        typing_speed_cpm: config.typing_speed_cpm.max(20),
+        typing_speed_cpm: clamp_typing_speed_cpm(config.typing_speed_cpm),
         hourly_distribution: (0..24)
             .map(|hour| HourlyUsageBucket { hour, sessions: 0 })
             .collect(),

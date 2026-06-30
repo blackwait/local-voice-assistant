@@ -121,6 +121,17 @@ export interface FunAsrHealthView {
   device: string;
 }
 
+export interface FunAsrResolveView {
+  ok: boolean;
+  service_profile: string;
+  funasr_endpoint: string;
+  deepseek_endpoint: string;
+  message: string;
+  model: string;
+  device: string;
+  fallback_used: boolean;
+}
+
 export interface AccessibilityPermissionView {
   trusted: boolean;
   platform: string;
@@ -174,6 +185,10 @@ export function startFunasrService() {
 
 export function checkFunasrService() {
   return invoke<FunAsrHealthView>("check_funasr_service");
+}
+
+export function resolveFunasrService() {
+  return invoke<FunAsrResolveView>("resolve_funasr_service");
 }
 
 export function polishText(input: string) {

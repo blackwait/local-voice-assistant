@@ -192,6 +192,17 @@ h1 {
   box-shadow: 0 0 0 3px rgba(46, 125, 91, 0.16);
 }
 
+.status-dot.error {
+  border-color: rgba(192, 57, 43, 0.35);
+  color: #8e2f21;
+  background: rgba(218, 77, 52, 0.08);
+}
+
+.status-dot.error i {
+  background: #c0392b;
+  box-shadow: 0 0 0 3px rgba(192, 57, 43, 0.18);
+}
+
 .workbench {
   display: grid;
   grid-template-columns: 320px 1fr;

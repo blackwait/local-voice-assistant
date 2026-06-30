@@ -132,7 +132,7 @@ impl Default for AppConfig {
             asr_engine: env::var("ASR_ENGINE").unwrap_or_else(|_| "funasr".to_string()),
             service_profile: default_service_profile(),
             funasr_endpoint: env::var("FUNASR_ENDPOINT")
-                .unwrap_or_else(|_| DEFAULT_FUNASR_REMOTE_ENDPOINT.to_string()),
+                .unwrap_or_else(|_| SERVICE_ENDPOINT_FAST.to_string()),
             funasr_model:
                 "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
                     .to_string(),
@@ -142,7 +142,7 @@ impl Default for AppConfig {
             deepseek_model: env::var("DEEPSEEK_MODEL")
                 .unwrap_or_else(|_| "deepseek-v4-flash".to_string()),
             deepseek_endpoint: env::var("DEEPSEEK_ENDPOINT")
-                .unwrap_or_else(|_| "http://10.254.81.32:10095".to_string()),
+                .unwrap_or_else(|_| SERVICE_ENDPOINT_FAST.to_string()),
             llm_base_url: env::var("LLM_BASE_URL").unwrap_or_else(|_| "".to_string()),
             translation_enabled: default_translation_enabled(),
             polish_enabled: default_polish_enabled(),
@@ -202,6 +202,18 @@ struct FunAsrHealthView {
     message: String,
     model: String,
     device: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FunAsrResolveView {
+    ok: bool,
+    service_profile: String,
+    funasr_endpoint: String,
+    deepseek_endpoint: String,
+    message: String,
+    model: String,
+    device: String,
+    fallback_used: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -404,6 +416,81 @@ fn stop_recording_and_transcribe(
 async fn check_funasr_service(app: AppHandle) -> Result<FunAsrHealthView, String> {
     let config = load_or_create_config(&app)?;
     check_funasr_health(&config).await
+}
+
+#[tauri::command]
+async fn resolve_funasr_service(app: AppHandle) -> Result<FunAsrResolveView, String> {
+    let mut config = load_or_create_config(&app)?;
+    let profile = normalize_service_profile_value(&config.service_profile);
+    if profile == SERVICE_PROFILE_CUSTOM {
+        return match check_funasr_health(&config).await {
+            Ok(health) => Ok(FunAsrResolveView {
+                ok: health.ok,
+                service_profile: config.service_profile.clone(),
+                funasr_endpoint: config.funasr_endpoint.clone(),
+                deepseek_endpoint: config.deepseek_endpoint.clone(),
+                message: health.message,
+                model: health.model,
+                device: health.device,
+                fallback_used: false,
+            }),
+            Err(message) => Ok(FunAsrResolveView {
+                ok: false,
+                service_profile: config.service_profile.clone(),
+                funasr_endpoint: config.funasr_endpoint.clone(),
+                deepseek_endpoint: config.deepseek_endpoint.clone(),
+                message,
+                model: String::new(),
+                device: String::new(),
+                fallback_used: false,
+            }),
+        };
+    }
+
+    if let Ok(health) = probe_funasr_endpoint(SERVICE_ENDPOINT_FAST).await {
+        config.service_profile = SERVICE_PROFILE_FAST.to_string();
+        config.funasr_endpoint = SERVICE_ENDPOINT_FAST.to_string();
+        config.deepseek_endpoint = SERVICE_ENDPOINT_FAST.to_string();
+        save_app_config(&app, &config)?;
+        return Ok(FunAsrResolveView {
+            ok: true,
+            service_profile: config.service_profile,
+            funasr_endpoint: config.funasr_endpoint,
+            deepseek_endpoint: config.deepseek_endpoint,
+            message: health.message,
+            model: health.model,
+            device: health.device,
+            fallback_used: false,
+        });
+    }
+
+    if let Ok(health) = probe_funasr_endpoint(DEFAULT_FUNASR_REMOTE_ENDPOINT).await {
+        config.service_profile = SERVICE_PROFILE_STABLE.to_string();
+        config.funasr_endpoint = DEFAULT_FUNASR_REMOTE_ENDPOINT.to_string();
+        config.deepseek_endpoint = DEFAULT_FUNASR_REMOTE_ENDPOINT.to_string();
+        save_app_config(&app, &config)?;
+        return Ok(FunAsrResolveView {
+            ok: true,
+            service_profile: config.service_profile,
+            funasr_endpoint: config.funasr_endpoint,
+            deepseek_endpoint: config.deepseek_endpoint,
+            message: health.message,
+            model: health.model,
+            device: health.device,
+            fallback_used: true,
+        });
+    }
+
+    Ok(FunAsrResolveView {
+        ok: false,
+        service_profile: config.service_profile,
+        funasr_endpoint: config.funasr_endpoint,
+        deepseek_endpoint: config.deepseek_endpoint,
+        message: "快速与稳定线路均不可用，请检查 FunASR 服务".to_string(),
+        model: String::new(),
+        device: String::new(),
+        fallback_used: false,
+    })
 }
 
 #[tauri::command]
@@ -1237,7 +1324,7 @@ impl AppConfig {
             record_shortcut: self.record_shortcut.clone(),
             shortcut_enabled: self.shortcut_enabled,
             polish_prompt: self.polish_prompt.clone(),
-            typing_speed_cpm: self.typing_speed_cpm.max(20),
+            typing_speed_cpm: usage_stats::clamp_typing_speed_cpm(self.typing_speed_cpm),
         }
     }
 }
@@ -1283,8 +1370,8 @@ fn normalize_config(_app: &AppHandle, config: &mut AppConfig) {
     if config.funasr_device.trim().is_empty() {
         config.funasr_device = "cpu".to_string();
     }
-    if config.typing_speed_cpm < 20 {
-        config.typing_speed_cpm = default_typing_speed_cpm();
+    if config.typing_speed_cpm < 20 || config.typing_speed_cpm > 100 {
+        config.typing_speed_cpm = usage_stats::clamp_typing_speed_cpm(config.typing_speed_cpm);
     }
     if config.deepseek_api_key.trim().is_empty() && config.llm_base_url.trim().is_empty() {
         config.deepseek_api_key = DEFAULT_DEEPSEEK_API_KEY.to_string();
@@ -2109,7 +2196,7 @@ fn transcribe_with_whisper(audio: Vec<u8>, config: &AppConfig) -> Result<String,
 }
 
 fn transcribe_with_funasr(audio: Vec<u8>, config: &AppConfig) -> Result<String, AppError> {
-    let endpoints = funasr_endpoints_to_try(config.funasr_endpoint.trim());
+    let endpoints = funasr_endpoints_for_config(config);
     if endpoints.is_empty() {
         return Err(AppError::WhisperFailed(
             "请先配置 FunASR 服务地址".to_string(),
@@ -2174,51 +2261,84 @@ fn transcribe_with_funasr(audio: Vec<u8>, config: &AppConfig) -> Result<String, 
     )))
 }
 
-async fn check_funasr_health(config: &AppConfig) -> Result<FunAsrHealthView, String> {
+async fn probe_funasr_endpoint(endpoint: &str) -> Result<FunAsrHealthView, String> {
+    let endpoint = normalize_endpoint(endpoint);
+    if endpoint.is_empty() {
+        return Err("FunASR 服务地址为空".to_string());
+    }
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(FUNASR_REQUEST_TIMEOUT_SECONDS))
         .build()
         .map_err(|error| format!("创建 FunASR 客户端失败：{error}"))?;
-    let mut last_error = String::new();
-    for endpoint in funasr_endpoints_to_try(config.funasr_endpoint.trim()) {
-        let response = match client.get(format!("{endpoint}/health")).send().await {
-            Ok(response) => response,
-            Err(error) => {
-                last_error = format!("{endpoint} 不可用：{error}");
-                continue;
-            }
-        };
-        if !response.status().is_success() {
-            last_error = format!("{endpoint} 异常：{}", response.status());
-            continue;
-        }
-        let value = response
-            .json::<Value>()
-            .await
-            .map_err(|error| error.to_string())?;
-        return Ok(FunAsrHealthView {
-            ok: value.get("ok").and_then(Value::as_bool).unwrap_or(false),
-            message: format!("FunASR 服务可用：{endpoint}"),
-            model: value
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            device: value
-                .get("device")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        });
+    let response = client
+        .get(format!("{endpoint}/health"))
+        .send()
+        .await
+        .map_err(|error| format!("{endpoint} 不可用：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("{endpoint} 异常：{}", response.status()));
     }
-    Err(format!(
-        "FunASR 服务不可用，已按顺序尝试远端和本地地址：{last_error}"
-    ))
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|error| error.to_string())?;
+    let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    if !ok {
+        return Err(format!("{endpoint} 健康检查未通过"));
+    }
+    Ok(FunAsrHealthView {
+        ok: true,
+        message: format!("FunASR 服务可用：{endpoint}"),
+        model: value
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        device: value
+            .get("device")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+async fn check_funasr_health(config: &AppConfig) -> Result<FunAsrHealthView, String> {
+    let mut last_error = String::new();
+    for endpoint in funasr_endpoints_for_config(config) {
+        match probe_funasr_endpoint(&endpoint).await {
+            Ok(health) => return Ok(health),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(if last_error.is_empty() {
+        "FunASR 服务不可用".to_string()
+    } else {
+        format!("FunASR 服务不可用：{last_error}")
+    })
 }
 
 fn normalize_endpoint(endpoint: &str) -> String {
     endpoint.trim().trim_end_matches('/').to_string()
+}
+
+fn push_unique_endpoint(endpoints: &mut Vec<String>, endpoint: &str) {
+    let normalized = normalize_endpoint(endpoint);
+    if !normalized.is_empty() && !endpoints.iter().any(|value| value == &normalized) {
+        endpoints.push(normalized);
+    }
+}
+
+fn funasr_endpoints_for_config(config: &AppConfig) -> Vec<String> {
+    let profile = normalize_service_profile_value(&config.service_profile);
+    if profile == SERVICE_PROFILE_CUSTOM {
+        return funasr_endpoints_to_try(config.funasr_endpoint.trim());
+    }
+    let mut endpoints = Vec::new();
+    push_unique_endpoint(&mut endpoints, SERVICE_ENDPOINT_FAST);
+    push_unique_endpoint(&mut endpoints, DEFAULT_FUNASR_REMOTE_ENDPOINT);
+    push_unique_endpoint(&mut endpoints, DEFAULT_FUNASR_LOCAL_ENDPOINT);
+    endpoints
 }
 
 fn funasr_endpoints_to_try(endpoint: &str) -> Vec<String> {
@@ -2591,7 +2711,7 @@ fn default_translation_enabled() -> bool {
 }
 
 fn default_service_profile() -> String {
-    SERVICE_PROFILE_STABLE.to_string()
+    SERVICE_PROFILE_FAST.to_string()
 }
 
 fn default_typing_speed_cpm() -> u32 {
@@ -2605,7 +2725,7 @@ fn infer_service_profile_from_endpoint(endpoint: &str) -> String {
     } else if normalized == normalize_endpoint(DEFAULT_FUNASR_REMOTE_ENDPOINT) {
         SERVICE_PROFILE_STABLE.to_string()
     } else if normalized.is_empty() {
-        SERVICE_PROFILE_STABLE.to_string()
+        SERVICE_PROFILE_FAST.to_string()
     } else {
         SERVICE_PROFILE_CUSTOM.to_string()
     }
@@ -2729,6 +2849,7 @@ pub fn run() {
             close_voice_overlay,
             stop_recording_and_transcribe,
             check_funasr_service,
+            resolve_funasr_service,
             start_funasr_service,
             polish_text,
             translate_text,

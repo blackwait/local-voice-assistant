@@ -33,7 +33,7 @@ import {
   WhisperModelProfile,
   cancelNativeRecording,
   checkAccessibilityPermission,
-  checkFunasrService,
+  resolveFunasrService,
   checkNativeRecording,
   closeVoiceOverlay,
   clearUsageStats,
@@ -58,6 +58,7 @@ import {
 import {
   SERVICE_PROFILE_OPTIONS,
   SERVICE_PROFILE_CUSTOM,
+  SERVICE_PROFILE_FAST,
   SERVICE_PROFILE_STABLE,
   getServiceProfileEndpoints,
   getServiceProfileLabel,
@@ -110,13 +111,13 @@ const DEFAULT_CONFIG: AppConfig = {
   whisper_model_profiles: [],
   whisper_threads: "8",
   asr_engine: "funasr",
-  service_profile: SERVICE_PROFILE_STABLE,
-  funasr_endpoint: "http://10.254.81.32:10095",
+  service_profile: SERVICE_PROFILE_FAST,
+  funasr_endpoint: "http://10.254.10.76:10095",
   funasr_model: "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
   funasr_device: "cpu",
   deepseek_api_key: "sk-5ccffb5099bb43cc9e98d85386b25cec",
   deepseek_model: "deepseek-v4-flash",
-  deepseek_endpoint: "http://10.254.81.32:10095",
+  deepseek_endpoint: "http://10.254.10.76:10095",
   llm_base_url: "",
   deepseek_key_configured: true,
   translation_enabled: false,
@@ -173,11 +174,13 @@ function MainApp() {
   const [usageStats, setUsageStats] = useState<UsageStatsSummary | null>(null);
   const [statsBusy, setStatsBusy] = useState(false);
   const [statsMessage, setStatsMessage] = useState("");
+  const [typingSpeedInput, setTypingSpeedInput] = useState("28");
   const sessionRecordingSecondsRef = useRef(0);
   const [targetLanguage, setTargetLanguage] = useState("中文");
   const [result, setResult] = useState<AssistantResult>();
   const [accessibilityStatus, setAccessibilityStatus] = useState<AccessibilityPermissionView>();
   const [appVersion, setAppVersion] = useState("");
+  const [funasrHealthOk, setFunasrHealthOk] = useState<boolean | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -187,6 +190,9 @@ function MainApp() {
         configRef.current = nextConfig;
         setTargetLanguage(nextConfig.target_language || "中文");
         targetLanguageRef.current = nextConfig.target_language || "中文";
+        if (nextConfig.asr_engine === "funasr") {
+          void refreshFunasrHealth();
+        }
       })
       .catch((err) => setError(toUserFacingError(err)));
     void refreshAccessibilityStatus();
@@ -194,6 +200,10 @@ function MainApp() {
       .then(setAppVersion)
       .catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    setTypingSpeedInput(String(config.typing_speed_cpm ?? 28));
+  }, [config.typing_speed_cpm]);
 
   useEffect(() => {
     configRef.current = config;
@@ -212,6 +222,9 @@ function MainApp() {
     }
     if (activeSection === "permission") {
       void refreshAccessibilityStatus();
+    }
+    if (activeSection === "model" && configRef.current.asr_engine === "funasr") {
+      void refreshFunasrHealth();
     }
   }, [activeSection]);
 
@@ -690,6 +703,20 @@ function MainApp() {
     }
   }
 
+  async function commitTypingSpeedInput() {
+    const parsed = Number(typingSpeedInput.trim());
+    const value = Number.isFinite(parsed) ? Math.min(100, Math.max(20, Math.round(parsed))) : 28;
+    setTypingSpeedInput(String(value));
+    updateConfig({ typing_speed_cpm: value });
+    try {
+      const saved = await saveConfig({ ...configRef.current, typing_speed_cpm: value });
+      setConfig(saved);
+      configRef.current = saved;
+    } catch (err) {
+      setStatsMessage(`手打速度保存失败：${toUserFacingError(err)}`);
+    }
+  }
+
   async function refreshUsageStats() {
     setStatsBusy(true);
     setStatsMessage("");
@@ -1017,6 +1044,31 @@ function MainApp() {
     }
   }
 
+  async function refreshFunasrHealth() {
+    if (configRef.current.asr_engine !== "funasr") {
+      setFunasrHealthOk(null);
+      return;
+    }
+    try {
+      const result = await resolveFunasrService();
+      setFunasrHealthOk(result.ok);
+      if (result.ok) {
+        setConfig((current) => {
+          const next: AppConfig = {
+            ...current,
+            service_profile: normalizeServiceProfile(result.service_profile),
+            funasr_endpoint: result.funasr_endpoint,
+            deepseek_endpoint: result.deepseek_endpoint
+          };
+          configRef.current = next;
+          return next;
+        });
+      }
+    } catch {
+      setFunasrHealthOk(false);
+    }
+  }
+
   async function checkFunasr() {
     setFunasrBusy(true);
     setConfigMessage("正在保存配置并检测 FunASR 服务");
@@ -1024,9 +1076,27 @@ function MainApp() {
     try {
       const saved = await saveConfig(config);
       setConfig(saved);
-      const health = await checkFunasrService();
-      setConfigMessage(`${health.message}：${health.model || saved.funasr_model} / ${health.device || saved.funasr_device}`);
+      configRef.current = saved;
+      const result = await resolveFunasrService();
+      setFunasrHealthOk(result.ok);
+      if (result.ok) {
+        const next: AppConfig = {
+          ...saved,
+          service_profile: normalizeServiceProfile(result.service_profile),
+          funasr_endpoint: result.funasr_endpoint,
+          deepseek_endpoint: result.deepseek_endpoint
+        };
+        setConfig(next);
+        configRef.current = next;
+        const fallbackHint = result.fallback_used ? "（已从快速回退到稳定）" : "";
+        setConfigMessage(
+          `${result.message}${fallbackHint}：${result.model || saved.funasr_model} / ${result.device || saved.funasr_device}`
+        );
+      } else {
+        setConfigMessage(result.message);
+      }
     } catch (err) {
+      setFunasrHealthOk(false);
       setConfigMessage("");
       setError(toUserFacingError(err));
     } finally {
@@ -1116,7 +1186,11 @@ function MainApp() {
           </h1>
         </div>
         <div className="status-strip">
-          <StatusDot ok={Boolean(config?.funasr_endpoint)} label="FunASR 服务" />
+          <StatusDot
+            ok={config.asr_engine !== "funasr" || funasrHealthOk === true}
+            error={config.asr_engine === "funasr" && funasrHealthOk === false}
+            label="FunASR 服务"
+          />
           <StatusDot ok={config.asr_engine === "funasr" || Boolean(config?.whisper_model_path)} label={asrEngineName(config)} />
           <StatusDot ok={Boolean(config?.deepseek_key_configured)} label="DeepSeek" />
           {isMacos ? <StatusDot ok={Boolean(accessibilityStatus?.trusted)} label="辅助功能" /> : null}
@@ -1388,18 +1462,21 @@ function MainApp() {
           <div className="stats-setting">
             <label>
               <span>手打速度参考（字/分钟）</span>
-              <small>影响节省时间估算，默认 28，范围 20–45</small>
+              <small>影响节省时间估算，默认 28，范围 20–100</small>
             </label>
             <input
               type="number"
               min={20}
-              max={45}
-              value={config.typing_speed_cpm ?? 28}
-              onChange={(event) => {
-                const value = Math.min(45, Math.max(20, Number(event.target.value) || 28));
-                updateConfig({ typing_speed_cpm: value });
+              max={100}
+              inputMode="numeric"
+              value={typingSpeedInput}
+              onChange={(event) => setTypingSpeedInput(event.target.value)}
+              onBlur={() => void commitTypingSpeedInput()}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.currentTarget.blur();
+                }
               }}
-              onBlur={() => void persistConfig()}
             />
           </div>
 
@@ -1512,7 +1589,7 @@ function MainApp() {
                   </button>
                 </div>
               </SettingRow>
-              <SettingRow title="服务线路" desc="稳定/快速为预设线路；自定义可填写任意 FunASR 服务地址">
+              <SettingRow title="服务线路" desc="默认快速线路；快速不可用时自动回退稳定；自定义可填写任意地址">
                 <select
                   value={normalizeServiceProfile(config.service_profile)}
                   onChange={(event) => selectServiceProfile(event.target.value as ServiceProfile)}
@@ -2078,9 +2155,10 @@ function modelNameFromPath(path: string) {
   return name || "自定义模型";
 }
 
-function StatusDot({ ok, label }: { ok: boolean; label: string }) {
+function StatusDot({ ok, label, error }: { ok: boolean; label: string; error?: boolean }) {
+  const className = ok ? "status-dot ok" : error ? "status-dot error" : "status-dot";
   return (
-    <span className={ok ? "status-dot ok" : "status-dot"}>
+    <span className={className}>
       <i />
       {label}
     </span>

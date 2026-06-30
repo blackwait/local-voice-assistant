@@ -13,14 +13,14 @@ export const SERVICE_PROFILE_OPTIONS: Array<{
   description: string;
 }> = [
   {
-    id: SERVICE_PROFILE_STABLE,
-    label: "稳定",
-    description: "默认线路，远端主服务器，适合日常使用"
-  },
-  {
     id: SERVICE_PROFILE_FAST,
     label: "快速",
-    description: "笔记本本地服务器，延迟更低"
+    description: "默认线路，笔记本本地服务器，延迟更低"
+  },
+  {
+    id: SERVICE_PROFILE_STABLE,
+    label: "稳定",
+    description: "远端主服务器；快速不可用时自动回退到此线路"
   },
   {
     id: SERVICE_PROFILE_CUSTOM,
@@ -55,7 +55,7 @@ export function getServiceProfileEndpoints(profile: ServiceProfile) {
 }
 
 export function getServiceProfileLabel(profile: ServiceProfile) {
-  return SERVICE_PROFILE_OPTIONS.find((option) => option.id === profile)?.label ?? "稳定";
+  return SERVICE_PROFILE_OPTIONS.find((option) => option.id === profile)?.label ?? "快速";
 }
 
 export function inferServiceProfileFromEndpoint(endpoint: string | undefined | null): ServiceProfile {
@@ -69,5 +69,5 @@ export function inferServiceProfileFromEndpoint(endpoint: string | undefined | n
   if (normalized) {
     return SERVICE_PROFILE_CUSTOM;
   }
-  return SERVICE_PROFILE_STABLE;
+  return SERVICE_PROFILE_FAST;
 }
