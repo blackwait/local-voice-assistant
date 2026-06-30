@@ -36,7 +36,10 @@ const MIN_TRANSCRIBE_RMS: f64 = 0.0035;
 const MIN_TRANSCRIBE_PEAK: f32 = 0.018;
 const MIN_TRANSCRIBE_SAMPLES: usize = 1600;
 const DEFAULT_FUNASR_REMOTE_ENDPOINT: &str = "http://10.254.81.32:10095";
+const SERVICE_ENDPOINT_FAST: &str = "http://10.254.10.76:10095";
 const DEFAULT_FUNASR_LOCAL_ENDPOINT: &str = "http://127.0.0.1:10095";
+const SERVICE_PROFILE_STABLE: &str = "stable";
+const SERVICE_PROFILE_FAST: &str = "fast";
 const FUNASR_REQUEST_TIMEOUT_SECONDS: u64 = 8;
 
 #[derive(Debug, Error)]
@@ -65,6 +68,8 @@ struct AppConfig {
     whisper_model_profiles: Vec<WhisperModelProfile>,
     whisper_threads: String,
     asr_engine: String,
+    #[serde(default = "default_service_profile")]
+    service_profile: String,
     funasr_endpoint: String,
     funasr_model: String,
     funasr_device: String,
@@ -114,6 +119,7 @@ impl Default for AppConfig {
             whisper_model_profiles: default_model_profiles(),
             whisper_threads: env::var("WHISPER_THREADS").unwrap_or_else(|_| "8".to_string()),
             asr_engine: env::var("ASR_ENGINE").unwrap_or_else(|_| "funasr".to_string()),
+            service_profile: default_service_profile(),
             funasr_endpoint: env::var("FUNASR_ENDPOINT")
                 .unwrap_or_else(|_| DEFAULT_FUNASR_REMOTE_ENDPOINT.to_string()),
             funasr_model:
@@ -144,6 +150,7 @@ struct AppConfigView {
     whisper_model_profiles: Vec<WhisperModelProfile>,
     whisper_threads: String,
     asr_engine: String,
+    service_profile: String,
     funasr_endpoint: String,
     funasr_model: String,
     funasr_device: String,
@@ -1175,6 +1182,7 @@ impl AppConfig {
             whisper_model_profiles: self.whisper_model_profiles.clone(),
             whisper_threads: self.whisper_threads.clone(),
             asr_engine: self.asr_engine.clone(),
+            service_profile: self.service_profile.clone(),
             funasr_endpoint: self.funasr_endpoint.clone(),
             funasr_model: self.funasr_model.clone(),
             funasr_device: self.funasr_device.clone(),
@@ -1218,9 +1226,11 @@ fn normalize_config(_app: &AppHandle, config: &mut AppConfig) {
     if config.polish_prompt.trim().is_empty() {
         config.polish_prompt = build_correction_prompt();
     }
-    if config.funasr_endpoint.trim().is_empty() {
-        config.funasr_endpoint = DEFAULT_FUNASR_REMOTE_ENDPOINT.to_string();
+    if config.service_profile.trim().is_empty() {
+        config.service_profile =
+            infer_service_profile_from_endpoint(config.funasr_endpoint.trim());
     }
+    apply_service_profile(config);
     if config.funasr_model.trim().is_empty() {
         config.funasr_model =
             "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
@@ -1228,12 +1238,6 @@ fn normalize_config(_app: &AppHandle, config: &mut AppConfig) {
     }
     if config.funasr_device.trim().is_empty() {
         config.funasr_device = "cpu".to_string();
-    }
-    if config.deepseek_endpoint.trim().is_empty()
-        && config.deepseek_api_key.trim().is_empty()
-        && config.llm_base_url.trim().is_empty()
-    {
-        config.deepseek_endpoint = "http://10.254.81.32:10095".to_string();
     }
     if config.deepseek_api_key.trim().is_empty() && config.llm_base_url.trim().is_empty() {
         config.deepseek_api_key = DEFAULT_DEEPSEEK_API_KEY.to_string();
@@ -2500,6 +2504,35 @@ fn default_record_shortcut() -> String {
 
 fn default_translation_enabled() -> bool {
     false
+}
+
+fn default_service_profile() -> String {
+    SERVICE_PROFILE_STABLE.to_string()
+}
+
+fn infer_service_profile_from_endpoint(endpoint: &str) -> String {
+    let normalized = normalize_endpoint(endpoint);
+    if normalized == normalize_endpoint(SERVICE_ENDPOINT_FAST) {
+        SERVICE_PROFILE_FAST.to_string()
+    } else {
+        SERVICE_PROFILE_STABLE.to_string()
+    }
+}
+
+fn apply_service_profile(config: &mut AppConfig) {
+    let profile = if config.service_profile.trim() == SERVICE_PROFILE_FAST {
+        SERVICE_PROFILE_FAST
+    } else {
+        SERVICE_PROFILE_STABLE
+    };
+    config.service_profile = profile.to_string();
+    let endpoint = if profile == SERVICE_PROFILE_FAST {
+        SERVICE_ENDPOINT_FAST
+    } else {
+        DEFAULT_FUNASR_REMOTE_ENDPOINT
+    };
+    config.funasr_endpoint = endpoint.to_string();
+    config.deepseek_endpoint = endpoint.to_string();
 }
 
 fn default_polish_enabled() -> bool {

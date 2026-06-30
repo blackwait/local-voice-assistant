@@ -1,11 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 
+export type ServiceProfile = "stable" | "fast";
+
 export interface AppConfig {
   whisper_cli_path: string;
   whisper_model_path: string;
   whisper_model_profiles: WhisperModelProfile[];
   whisper_threads: string;
   asr_engine: string;
+  service_profile: ServiceProfile;
   funasr_endpoint: string;
   funasr_model: string;
   funasr_device: string;

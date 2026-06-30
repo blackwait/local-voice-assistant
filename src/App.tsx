@@ -51,6 +51,14 @@ import {
   stopRecordingAndTranscribe,
   translateText
 } from "./tauri";
+import {
+  SERVICE_PROFILE_OPTIONS,
+  SERVICE_PROFILE_STABLE,
+  getServiceProfileEndpoints,
+  getServiceProfileLabel,
+  normalizeServiceProfile,
+  type ServiceProfile
+} from "./serviceProfiles";
 
 type Stage = "idle" | "recording" | "stopping" | "transcribing" | "recognized" | "polishing" | "translating" | "done" | "error";
 type Section = "home" | "permission" | "hotkey" | "ai" | "model" | "history";
@@ -96,6 +104,7 @@ const DEFAULT_CONFIG: AppConfig = {
   whisper_model_profiles: [],
   whisper_threads: "8",
   asr_engine: "funasr",
+  service_profile: SERVICE_PROFILE_STABLE,
   funasr_endpoint: "http://10.254.81.32:10095",
   funasr_model: "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
   funasr_device: "cpu",
@@ -798,6 +807,15 @@ function MainApp() {
     setConfigMessage("");
   }
 
+  function selectServiceProfile(profile: ServiceProfile) {
+    const endpoints = getServiceProfileEndpoints(profile);
+    updateConfig({
+      service_profile: profile,
+      funasr_endpoint: endpoints.funasr_endpoint,
+      deepseek_endpoint: endpoints.deepseek_endpoint
+    });
+  }
+
   async function persistConfig() {
     setError("");
     setConfigMessage("正在保存配置");
@@ -1123,8 +1141,12 @@ function MainApp() {
                 <dd>{asrEngineName(config)}</dd>
                 <dt>DeepSeek 模型</dt>
                 <dd>{config?.deepseek_model ?? "检测中"}</dd>
-                <dt>{config.asr_engine === "funasr" ? "服务地址" : "Whisper CLI"}</dt>
-                <dd>{config.asr_engine === "funasr" ? config.funasr_endpoint : config?.whisper_cli_path || "未配置"}</dd>
+                <dt>{config.asr_engine === "funasr" ? "服务线路" : "Whisper CLI"}</dt>
+                <dd>
+                  {config.asr_engine === "funasr"
+                    ? getServiceProfileLabel(normalizeServiceProfile(config.service_profile))
+                    : config?.whisper_cli_path || "未配置"}
+                </dd>
               </dl>
             </div>
           </aside>
@@ -1282,7 +1304,7 @@ function MainApp() {
 
           {config.asr_engine === "funasr" ? (
             <>
-              <SettingRow title="FunASR 服务" desc="默认优先使用远端 10.254.81.32:10095，失败时自动回退到本机 127.0.0.1:10095">
+              <SettingRow title="FunASR 服务" desc="检测或启动本机 FunASR；识别与 AI 润色默认走所选服务线路">
                 <div className="service-actions">
                   <button className="primary" disabled={funasrBusy} onClick={() => void startFunasr()}>
                     {funasrBusy ? <Loader2 size={16} className="spin" /> : <Server size={16} />}
@@ -1293,8 +1315,17 @@ function MainApp() {
                   </button>
                 </div>
               </SettingRow>
-              <SettingRow title="服务地址" desc="默认填写远端地址；代码会先试这里，失败后自动回退本机 127.0.0.1:10095">
-                <input value={config.funasr_endpoint} onChange={(event) => updateConfig({ funasr_endpoint: event.target.value })} />
+              <SettingRow title="服务线路" desc="稳定为默认远端主服务器；快速为笔记本本地服务器，延迟更低">
+                <select
+                  value={normalizeServiceProfile(config.service_profile)}
+                  onChange={(event) => selectServiceProfile(event.target.value as ServiceProfile)}
+                >
+                  {SERVICE_PROFILE_OPTIONS.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
               </SettingRow>
               <SettingRow title="FunASR 模型" desc="默认 Paraformer-large；可换成已支持的 ModelScope 模型名或本地路径">
                 <input value={config.funasr_model} onChange={(event) => updateConfig({ funasr_model: event.target.value })} />
@@ -1427,12 +1458,17 @@ function MainApp() {
           <SettingRow title="DeepSeek 模型" desc="用于 AI 润色、补标点和翻译">
             <input value={config.deepseek_model} onChange={(event) => updateConfig({ deepseek_model: event.target.value })} />
           </SettingRow>
-          <SettingRow title="DeepSeek 服务地址" desc="留空时本机直连；填写云端地址后由服务端代理调用">
-            <input
-              value={config.deepseek_endpoint}
-              onChange={(event) => updateConfig({ deepseek_endpoint: event.target.value })}
-              placeholder="http://10.254.81.32:10095"
-            />
+          <SettingRow title="服务线路" desc="AI 润色与翻译走模型设置里选择的稳定/快速线路">
+            <select
+              value={normalizeServiceProfile(config.service_profile)}
+              onChange={(event) => selectServiceProfile(event.target.value as ServiceProfile)}
+            >
+              {SERVICE_PROFILE_OPTIONS.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
           </SettingRow>
           <SettingRow title="AI 润色" desc="关闭后直接将识别原文输出到光标，零 LLM 延迟；翻译仍可独立开启">
             <label className="switch-row">
