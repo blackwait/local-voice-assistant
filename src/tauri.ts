@@ -1,6 +1,74 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type ServiceProfile = "stable" | "fast";
+export type ServiceProfile = "stable" | "fast" | "custom";
+
+export interface SessionMetrics {
+  recording_seconds: number;
+  transcribe_seconds: number;
+  polish_seconds: number;
+  translation_seconds: number;
+}
+
+export interface DailyUsageBucket {
+  date: string;
+  sessions: number;
+  chars: number;
+  saved_seconds: number;
+}
+
+export interface HourlyUsageBucket {
+  hour: number;
+  sessions: number;
+}
+
+export interface UsageEvent {
+  id: string;
+  created_at: number;
+  char_count: number;
+  recording_seconds: number;
+  transcribe_seconds: number;
+  polish_seconds: number;
+  translation_seconds: number;
+  total_seconds: number;
+  estimated_typing_seconds: number;
+  saved_seconds: number;
+  polish_enabled: boolean;
+  translation_enabled: boolean;
+  service_profile: string;
+  success: boolean;
+}
+
+export interface UsageStatsSummary {
+  total_sessions: number;
+  successful_sessions: number;
+  today_sessions: number;
+  week_sessions: number;
+  month_sessions: number;
+  active_days: number;
+  total_chars: number;
+  today_chars: number;
+  week_chars: number;
+  month_chars: number;
+  avg_chars_per_session: number;
+  total_recording_seconds: number;
+  total_processing_seconds: number;
+  total_estimated_typing_seconds: number;
+  total_saved_seconds: number;
+  today_saved_seconds: number;
+  week_saved_seconds: number;
+  month_saved_seconds: number;
+  avg_saved_per_session: number;
+  avg_total_seconds: number;
+  avg_transcribe_seconds: number;
+  avg_polish_seconds: number;
+  polish_usage_count: number;
+  translation_usage_count: number;
+  longest_session_chars: number;
+  typing_speed_cpm: number;
+  daily_last_14_days: DailyUsageBucket[];
+  hourly_distribution: HourlyUsageBucket[];
+  recent_events: UsageEvent[];
+}
 
 export interface AppConfig {
   whisper_cli_path: string;
@@ -24,6 +92,7 @@ export interface AppConfig {
   record_shortcut: string;
   shortcut_enabled: boolean;
   polish_prompt: string;
+  typing_speed_cpm: number;
 }
 
 export interface WhisperModelProfile {
@@ -144,6 +213,18 @@ export function copyTextToClipboard(text: string) {
 
 export function recordVoiceHistory(text: string) {
   return invoke<VoiceHistoryItem>("record_voice_history", { text });
+}
+
+export function recordVoiceSession(text: string, metrics: SessionMetrics) {
+  return invoke<VoiceHistoryItem>("record_voice_session", { text, metrics });
+}
+
+export function getUsageStats() {
+  return invoke<UsageStatsSummary>("get_usage_stats");
+}
+
+export function clearUsageStats() {
+  return invoke<void>("clear_usage_stats");
 }
 
 export function listVoiceHistory() {

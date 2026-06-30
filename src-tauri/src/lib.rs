@@ -21,6 +21,13 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 use tempfile::Builder;
 use thiserror::Error;
 
+mod usage_stats;
+
+use usage_stats::{
+    clear_usage_events, get_usage_stats_summary, record_usage_event_inner, SessionMetrics,
+    UsageStatsSummary, wav_duration_seconds,
+};
+
 const MAX_RECORDING_SECONDS: usize = 60;
 const DEFAULT_DEEPSEEK_API_KEY: &str = "sk-5ccffb5099bb43cc9e98d85386b25cec";
 const RECORD_SHORTCUT_EVENT: &str = "record-shortcut-pressed";
@@ -40,10 +47,11 @@ const SERVICE_ENDPOINT_FAST: &str = "http://10.254.10.76:10095";
 const DEFAULT_FUNASR_LOCAL_ENDPOINT: &str = "http://127.0.0.1:10095";
 const SERVICE_PROFILE_STABLE: &str = "stable";
 const SERVICE_PROFILE_FAST: &str = "fast";
+const SERVICE_PROFILE_CUSTOM: &str = "custom";
 const FUNASR_REQUEST_TIMEOUT_SECONDS: u64 = 8;
 
 #[derive(Debug, Error)]
-enum AppError {
+pub(crate) enum AppError {
     #[error("本地 Whisper 模型不可用")]
     MissingWhisperModel,
     #[error("本地 whisper 命令执行失败：{0}")]
@@ -90,6 +98,9 @@ struct AppConfig {
     shortcut_enabled: bool,
     #[serde(default)]
     polish_prompt: String,
+    /// 估算手写速度（字/分钟），用于保守计算节省时间。
+    #[serde(default = "default_typing_speed_cpm")]
+    typing_speed_cpm: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +150,7 @@ impl Default for AppConfig {
             record_shortcut: default_record_shortcut(),
             shortcut_enabled: true,
             polish_prompt: String::new(),
+            typing_speed_cpm: default_typing_speed_cpm(),
         }
     }
 }
@@ -166,6 +178,7 @@ struct AppConfigView {
     record_shortcut: String,
     shortcut_enabled: bool,
     polish_prompt: String,
+    typing_speed_cpm: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -310,6 +323,31 @@ fn copy_text_to_clipboard(text: String) -> Result<(), String> {
 #[tauri::command]
 fn record_voice_history(app: AppHandle, text: String) -> Result<VoiceHistoryItem, String> {
     record_voice_history_inner(&app, text).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn record_voice_session(
+    app: AppHandle,
+    text: String,
+    metrics: SessionMetrics,
+) -> Result<VoiceHistoryItem, String> {
+    let config = load_or_create_config(&app)?;
+    let item = record_voice_history_inner(&app, text.clone()).map_err(|error| error.to_string())?;
+    if let Err(error) = record_usage_event_inner(&app, &config, &text, &metrics) {
+        eprintln!("usage stats save failed: {error}");
+    }
+    Ok(item)
+}
+
+#[tauri::command]
+fn get_usage_stats(app: AppHandle) -> Result<UsageStatsSummary, String> {
+    let config = load_or_create_config(&app)?;
+    get_usage_stats_summary(&app, &config).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn clear_usage_stats(app: AppHandle) -> Result<(), String> {
+    clear_usage_events(&app).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1199,6 +1237,7 @@ impl AppConfig {
             record_shortcut: self.record_shortcut.clone(),
             shortcut_enabled: self.shortcut_enabled,
             polish_prompt: self.polish_prompt.clone(),
+            typing_speed_cpm: self.typing_speed_cpm.max(20),
         }
     }
 }
@@ -1229,6 +1268,11 @@ fn normalize_config(_app: &AppHandle, config: &mut AppConfig) {
     if config.service_profile.trim().is_empty() {
         config.service_profile =
             infer_service_profile_from_endpoint(config.funasr_endpoint.trim());
+    } else if normalize_service_profile_value(&config.service_profile) != SERVICE_PROFILE_CUSTOM {
+        let inferred = infer_service_profile_from_endpoint(config.funasr_endpoint.trim());
+        if inferred == SERVICE_PROFILE_CUSTOM {
+            config.service_profile = SERVICE_PROFILE_CUSTOM.to_string();
+        }
     }
     apply_service_profile(config);
     if config.funasr_model.trim().is_empty() {
@@ -1238,6 +1282,9 @@ fn normalize_config(_app: &AppHandle, config: &mut AppConfig) {
     }
     if config.funasr_device.trim().is_empty() {
         config.funasr_device = "cpu".to_string();
+    }
+    if config.typing_speed_cpm < 20 {
+        config.typing_speed_cpm = default_typing_speed_cpm();
     }
     if config.deepseek_api_key.trim().is_empty() && config.llm_base_url.trim().is_empty() {
         config.deepseek_api_key = DEFAULT_DEEPSEEK_API_KEY.to_string();
@@ -1434,18 +1481,19 @@ fn transcribe_recording_from_hotkey(app: AppHandle) {
         "正在处理录音",
         0.28,
     );
-    let result = (|| -> Result<(AppConfig, String), String> {
+    let result = (|| -> Result<(AppConfig, String, f64), String> {
         let config = load_or_create_config(&app)?;
         let state = app
             .try_state::<RecorderState>()
             .ok_or_else(|| "录音状态未初始化".to_string())?;
         let audio = stop_recording(&state).map_err(|error| error.to_string())?;
+        let recording_seconds = wav_duration_seconds(&audio);
         let text = transcribe_audio(audio, &config).map_err(|error| error.to_string())?;
-        Ok((config, text))
+        Ok((config, text, recording_seconds))
     })();
     let transcribe_seconds = (started_at.elapsed().as_secs_f64() * 10.0).round() / 10.0;
     match result {
-        Ok((config, text)) => {
+        Ok((config, text, recording_seconds)) => {
             emit_overlay_state(
                 &app,
                 "recognized",
@@ -1454,8 +1502,14 @@ fn transcribe_recording_from_hotkey(app: AppHandle) {
                 "正在准备 AI 处理",
                 0.05,
             );
-            if let Err(error) =
-                process_hotkey_transcription(&app, text, config, started_at, transcribe_seconds)
+            if let Err(error) = process_hotkey_transcription(
+                &app,
+                text,
+                config,
+                started_at,
+                transcribe_seconds,
+                recording_seconds,
+            )
             {
                 let seconds = elapsed_tenths(started_at);
                 emit_overlay_state(&app, "error", "处理失败", seconds, &error, 0.1);
@@ -1491,6 +1545,7 @@ fn process_hotkey_transcription(
     config: AppConfig,
     started_at: Instant,
     transcribe_seconds: f64,
+    recording_seconds: f64,
 ) -> Result<(), String> {
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -1518,7 +1573,17 @@ fn process_hotkey_transcription(
             notes: vec![notes_text],
             confidence: "medium".to_string(),
         };
-        output_hotkey_final_text(app, &result.corrected_text)?;
+        output_hotkey_final_text_with_stats(
+            app,
+            &config,
+            &result.corrected_text,
+            SessionMetrics {
+                recording_seconds,
+                transcribe_seconds,
+                polish_seconds: 0.0,
+                translation_seconds: 0.0,
+            },
+        )?;
         let seconds = elapsed_tenths(started_at);
         emit_overlay_state(
             app,
@@ -1576,7 +1641,20 @@ fn process_hotkey_transcription(
         None
     };
 
-    output_hotkey_final_text(app, &correction.corrected_text)?;
+    let (translation_text, translation_seconds) =
+        translation.unwrap_or_else(|| (String::new(), 0.0));
+
+    output_hotkey_final_text_with_stats(
+        app,
+        &config,
+        &correction.corrected_text,
+        SessionMetrics {
+            recording_seconds,
+            transcribe_seconds,
+            polish_seconds: correction_seconds,
+            translation_seconds,
+        },
+    )?;
     let total_seconds = elapsed_tenths(started_at);
     emit_overlay_state(
         app,
@@ -1587,8 +1665,6 @@ fn process_hotkey_transcription(
         0.1,
     );
 
-    let (translation_text, translation_seconds) =
-        translation.unwrap_or_else(|| (String::new(), 0.0));
     let result = AssistantResult {
         corrected_text: correction.corrected_text,
         translation: translation_text,
@@ -1610,9 +1686,17 @@ fn process_hotkey_transcription(
     Ok(())
 }
 
-fn output_hotkey_final_text(app: &AppHandle, text: &str) -> Result<(), String> {
+fn output_hotkey_final_text_with_stats(
+    app: &AppHandle,
+    config: &AppConfig,
+    text: &str,
+    metrics: SessionMetrics,
+) -> Result<(), String> {
     if let Err(error) = record_voice_history_inner(app, text.to_string()) {
         eprintln!("voice history save failed: {error}");
+    }
+    if let Err(error) = record_usage_event_inner(app, config, text, &metrics) {
+        eprintln!("usage stats save failed: {error}");
     }
     output_text_to_cursor_inner(app, text.to_string()).map_err(|error| {
         format!(
@@ -1742,7 +1826,7 @@ fn save_app_config(app: &AppHandle, config: &AppConfig) -> Result<(), String> {
     fs::write(path, text).map_err(|error| error.to_string())
 }
 
-fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
@@ -2510,22 +2594,43 @@ fn default_service_profile() -> String {
     SERVICE_PROFILE_STABLE.to_string()
 }
 
+fn default_typing_speed_cpm() -> u32 {
+    usage_stats::default_typing_speed_cpm()
+}
+
 fn infer_service_profile_from_endpoint(endpoint: &str) -> String {
     let normalized = normalize_endpoint(endpoint);
     if normalized == normalize_endpoint(SERVICE_ENDPOINT_FAST) {
         SERVICE_PROFILE_FAST.to_string()
-    } else {
+    } else if normalized == normalize_endpoint(DEFAULT_FUNASR_REMOTE_ENDPOINT) {
         SERVICE_PROFILE_STABLE.to_string()
+    } else if normalized.is_empty() {
+        SERVICE_PROFILE_STABLE.to_string()
+    } else {
+        SERVICE_PROFILE_CUSTOM.to_string()
+    }
+}
+
+fn normalize_service_profile_value(profile: &str) -> &'static str {
+    match profile.trim() {
+        SERVICE_PROFILE_FAST => SERVICE_PROFILE_FAST,
+        SERVICE_PROFILE_CUSTOM => SERVICE_PROFILE_CUSTOM,
+        _ => SERVICE_PROFILE_STABLE,
     }
 }
 
 fn apply_service_profile(config: &mut AppConfig) {
-    let profile = if config.service_profile.trim() == SERVICE_PROFILE_FAST {
-        SERVICE_PROFILE_FAST
-    } else {
-        SERVICE_PROFILE_STABLE
-    };
+    let profile = normalize_service_profile_value(&config.service_profile);
     config.service_profile = profile.to_string();
+    if profile == SERVICE_PROFILE_CUSTOM {
+        if config.funasr_endpoint.trim().is_empty() {
+            config.funasr_endpoint = DEFAULT_FUNASR_REMOTE_ENDPOINT.to_string();
+        }
+        if config.deepseek_endpoint.trim().is_empty() {
+            config.deepseek_endpoint = config.funasr_endpoint.clone();
+        }
+        return;
+    }
     let endpoint = if profile == SERVICE_PROFILE_FAST {
         SERVICE_ENDPOINT_FAST
     } else {
@@ -2536,11 +2641,16 @@ fn apply_service_profile(config: &mut AppConfig) {
 }
 
 fn default_polish_enabled() -> bool {
-    // 默认开启 AI 润色，保留历史行为；可通过 .env 的 POLISH_ENABLED=0 关闭。
+    // 默认关闭 AI 润色，直接输出识别原文；可通过 .env 的 POLISH_ENABLED=1 开启。
     env::var("POLISH_ENABLED")
         .ok()
-        .map(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off" | ""))
-        .unwrap_or(true)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn default_whisper_model_path() -> String {
@@ -2608,6 +2718,9 @@ pub fn run() {
             open_accessibility_settings,
             copy_text_to_clipboard,
             record_voice_history,
+            record_voice_session,
+            get_usage_stats,
+            clear_usage_stats,
             list_voice_history,
             delete_voice_history,
             clear_voice_history,

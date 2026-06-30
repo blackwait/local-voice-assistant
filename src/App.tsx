@@ -1,5 +1,6 @@
 import {
   Bot,
+  BarChart3,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -35,33 +36,38 @@ import {
   checkFunasrService,
   checkNativeRecording,
   closeVoiceOverlay,
+  clearUsageStats,
   clearVoiceHistory,
   copyTextToClipboard,
   deleteVoiceHistory,
   getDefaultPolishPrompt,
+  getUsageStats,
   listVoiceHistory,
   loadConfig,
   openAccessibilitySettings,
   outputTextToCursor,
   polishText,
-  recordVoiceHistory,
+  recordVoiceSession,
   saveConfig,
   startFunasrService,
   startNativeRecording,
   stopRecordingAndTranscribe,
-  translateText
+  translateText,
+  UsageStatsSummary
 } from "./tauri";
 import {
   SERVICE_PROFILE_OPTIONS,
+  SERVICE_PROFILE_CUSTOM,
   SERVICE_PROFILE_STABLE,
   getServiceProfileEndpoints,
   getServiceProfileLabel,
+  isCustomServiceProfile,
   normalizeServiceProfile,
   type ServiceProfile
 } from "./serviceProfiles";
 
 type Stage = "idle" | "recording" | "stopping" | "transcribing" | "recognized" | "polishing" | "translating" | "done" | "error";
-type Section = "home" | "permission" | "hotkey" | "ai" | "model" | "history";
+type Section = "home" | "permission" | "hotkey" | "ai" | "model" | "history" | "stats";
 type VoiceOverlayState = {
   stage: Stage;
   status: string;
@@ -114,12 +120,13 @@ const DEFAULT_CONFIG: AppConfig = {
   llm_base_url: "",
   deepseek_key_configured: true,
   translation_enabled: false,
-  polish_enabled: true,
+  polish_enabled: false,
   target_language: "中文",
   config_path: "",
   record_shortcut: "CommandOrControl+1",
   shortcut_enabled: true,
-  polish_prompt: ""
+  polish_prompt: "",
+  typing_speed_cpm: 28
 };
 const SHORTCUT_PRESETS = ["F2", "F3", "F4", "F8", "CapsLock", "CommandOrControl+1", "CommandOrControl+Shift+Space", "CommandOrControl+Alt+Space"];
 
@@ -163,6 +170,10 @@ function MainApp() {
   const [historyPage, setHistoryPage] = useState(1);
   const [historyBusy, setHistoryBusy] = useState(false);
   const [historyMessage, setHistoryMessage] = useState("");
+  const [usageStats, setUsageStats] = useState<UsageStatsSummary | null>(null);
+  const [statsBusy, setStatsBusy] = useState(false);
+  const [statsMessage, setStatsMessage] = useState("");
+  const sessionRecordingSecondsRef = useRef(0);
   const [targetLanguage, setTargetLanguage] = useState("中文");
   const [result, setResult] = useState<AssistantResult>();
   const [accessibilityStatus, setAccessibilityStatus] = useState<AccessibilityPermissionView>();
@@ -195,6 +206,9 @@ function MainApp() {
   useEffect(() => {
     if (activeSection === "history") {
       void refreshHistory();
+    }
+    if (activeSection === "stats") {
+      void refreshUsageStats();
     }
     if (activeSection === "permission") {
       void refreshAccessibilityStatus();
@@ -430,6 +444,7 @@ function MainApp() {
     const finalSeconds = recordingStartedAtRef.current
       ? Math.min(MAX_SECONDS, (Date.now() - recordingStartedAtRef.current) / 1000)
       : seconds;
+    sessionRecordingSecondsRef.current = finalSeconds;
     clearTimer();
     recordingStartedAtRef.current = undefined;
     setSeconds(finalSeconds);
@@ -442,6 +457,7 @@ function MainApp() {
     if (stageRef.current !== "recording") {
       return;
     }
+    sessionRecordingSecondsRef.current = seconds;
     clearTimer();
     recordingStartedAtRef.current = undefined;
     startProcessingTimer();
@@ -659,10 +675,52 @@ function MainApp() {
 
   async function saveHistoryText(text: string) {
     try {
-      const item = await recordVoiceHistory(text);
+      const item = await recordVoiceSession(text, {
+        recording_seconds: sessionRecordingSecondsRef.current,
+        transcribe_seconds: transcribeSeconds ?? 0,
+        polish_seconds: correctionSeconds ?? 0,
+        translation_seconds: translationSeconds ?? 0
+      });
       setHistoryItems((items) => [item, ...items.filter((current) => current.id !== item.id)].slice(0, 100));
+      if (activeSection === "stats") {
+        void refreshUsageStats();
+      }
     } catch (err) {
       setHistoryMessage(`历史记录保存失败：${toUserFacingError(err)}`);
+    }
+  }
+
+  async function refreshUsageStats() {
+    setStatsBusy(true);
+    setStatsMessage("");
+    try {
+      const stats = await getUsageStats();
+      setUsageStats(stats);
+    } catch (err) {
+      setStatsMessage(toUserFacingError(err));
+    } finally {
+      setStatsBusy(false);
+    }
+  }
+
+  async function resetUsageStats() {
+    if (!usageStats?.total_sessions) {
+      return;
+    }
+    if (!window.confirm("确认清空全部使用统计数据？历史语音记录不会删除。")) {
+      return;
+    }
+    setStatsBusy(true);
+    setStatsMessage("");
+    try {
+      await clearUsageStats();
+      setUsageStats(null);
+      await refreshUsageStats();
+      setStatsMessage("统计数据已清空");
+    } catch (err) {
+      setStatsMessage(toUserFacingError(err));
+    } finally {
+      setStatsBusy(false);
     }
   }
 
@@ -809,6 +867,10 @@ function MainApp() {
 
   function selectServiceProfile(profile: ServiceProfile) {
     const endpoints = getServiceProfileEndpoints(profile);
+    if (!endpoints) {
+      updateConfig({ service_profile: profile });
+      return;
+    }
     updateConfig({
       service_profile: profile,
       funasr_endpoint: endpoints.funasr_endpoint,
@@ -1068,6 +1130,7 @@ function MainApp() {
         <TabButton active={activeSection === "ai"} icon={<Bot size={16} />} label="AI 设置" onClick={() => setActiveSection("ai")} />
         <TabButton active={activeSection === "model"} icon={<Settings2 size={16} />} label="模型设置" onClick={() => setActiveSection("model")} />
         <TabButton active={activeSection === "history"} icon={<History size={16} />} label="历史语音" onClick={() => setActiveSection("history")} />
+        <TabButton active={activeSection === "stats"} icon={<BarChart3 size={16} />} label="使用统计" onClick={() => setActiveSection("stats")} />
       </nav>
 
       {activeSection === "home" ? (
@@ -1147,6 +1210,12 @@ function MainApp() {
                     ? getServiceProfileLabel(normalizeServiceProfile(config.service_profile))
                     : config?.whisper_cli_path || "未配置"}
                 </dd>
+                {config.asr_engine === "funasr" ? (
+                  <>
+                    <dt>FunASR 地址</dt>
+                    <dd className="mono-clip">{config.funasr_endpoint || "未配置"}</dd>
+                  </>
+                ) : null}
               </dl>
             </div>
           </aside>
@@ -1293,6 +1362,134 @@ function MainApp() {
         </section>
       ) : null}
 
+      {activeSection === "stats" ? (
+        <section className="stats-panel">
+          <header className="stats-head">
+            <div>
+              <h2>使用统计</h2>
+              <p>数据仅保存在本机，用于了解语音输入习惯与大致效率。</p>
+            </div>
+            <div className="stats-actions">
+              <button className="icon-button wide" disabled={statsBusy} onClick={() => void refreshUsageStats()}>
+                {statsBusy ? <Loader2 size={16} className="spin" /> : <RotateCcw size={16} />}
+                刷新
+              </button>
+              <button className="icon-button wide danger-text" disabled={statsBusy || !usageStats?.total_sessions} onClick={() => void resetUsageStats()}>
+                <Trash2 size={16} />
+                清空统计
+              </button>
+            </div>
+          </header>
+
+          <div className="info-box stats-note">
+            预计节省时间按「假设手打速度 − 实际语音流程耗时」估算，并打 7 折、单次上限 2 分钟；短文本会进一步打折，仅供参考。
+          </div>
+
+          <div className="stats-setting">
+            <label>
+              <span>手打速度参考（字/分钟）</span>
+              <small>影响节省时间估算，默认 28，范围 20–45</small>
+            </label>
+            <input
+              type="number"
+              min={20}
+              max={45}
+              value={config.typing_speed_cpm ?? 28}
+              onChange={(event) => {
+                const value = Math.min(45, Math.max(20, Number(event.target.value) || 28));
+                updateConfig({ typing_speed_cpm: value });
+              }}
+              onBlur={() => void persistConfig()}
+            />
+          </div>
+
+          {statsMessage ? <div className={statsMessage.includes("失败") ? "error-box" : "info-box"}>{statsMessage}</div> : null}
+
+          {usageStats && usageStats.total_sessions > 0 ? (
+            <>
+              <div className="stats-grid">
+                <StatsCard title="累计次数" value={`${usageStats.total_sessions}`} hint={`成功 ${usageStats.successful_sessions} 次`} />
+                <StatsCard title="今日 / 本周 / 本月" value={`${usageStats.today_sessions} / ${usageStats.week_sessions} / ${usageStats.month_sessions}`} hint={`活跃 ${usageStats.active_days} 天`} />
+                <StatsCard title="累计字数" value={formatNumber(usageStats.total_chars)} hint={`均每次 ${Math.round(usageStats.avg_chars_per_session)} 字`} />
+                <StatsCard title="今日字数" value={formatNumber(usageStats.today_chars)} hint={`本周 ${formatNumber(usageStats.week_chars)} · 本月 ${formatNumber(usageStats.month_chars)}`} />
+                <StatsCard title="预计节省" value={formatDurationSeconds(usageStats.total_saved_seconds)} hint={`今日 ${formatDurationSeconds(usageStats.today_saved_seconds)}`} accent />
+                <StatsCard title="本周 / 本月节省" value={`${formatDurationSeconds(usageStats.week_saved_seconds)} / ${formatDurationSeconds(usageStats.month_saved_seconds)}`} hint={`均每次 ${formatDurationSeconds(usageStats.avg_saved_per_session)}`} />
+                <StatsCard title="录音总时长" value={formatDurationSeconds(usageStats.total_recording_seconds)} hint={`处理 ${formatDurationSeconds(usageStats.total_processing_seconds)}`} />
+                <StatsCard title="均流程耗时" value={formatDurationSeconds(usageStats.avg_total_seconds)} hint={`识别 ${formatDurationSeconds(usageStats.avg_transcribe_seconds)} · 润色 ${formatDurationSeconds(usageStats.avg_polish_seconds)}`} />
+                <StatsCard title="AI 润色使用" value={`${usageStats.polish_usage_count} 次`} hint={`翻译 ${usageStats.translation_usage_count} 次`} />
+                <StatsCard title="单次最长" value={`${usageStats.longest_session_chars} 字`} hint={`手打参考 ${usageStats.typing_speed_cpm} 字/分`} />
+              </div>
+
+              <div className="stats-charts">
+                <article className="stats-chart-card">
+                  <h3>近 14 天使用</h3>
+                  <div className="stats-bar-chart">
+                    {usageStats.daily_last_14_days.map((bucket) => (
+                      <div className="stats-bar-col" key={bucket.date} title={`${bucket.date}: ${bucket.sessions} 次, ${bucket.chars} 字, 节省 ${formatDurationSeconds(bucket.saved_seconds)}`}>
+                        <div className="stats-bar-stack">
+                          <div className="stats-bar sessions" style={{ height: `${barHeight(bucket.sessions, maxDailySessions(usageStats.daily_last_14_days))}%` }} />
+                        </div>
+                        <span className="stats-bar-label">{formatShortDate(bucket.date)}</span>
+                        <small>{bucket.sessions}</small>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="stats-chart-legend">柱高 = 当日次数</p>
+                </article>
+
+                <article className="stats-chart-card">
+                  <h3>时段分布（0–23 点）</h3>
+                  <div className="stats-bar-chart hourly">
+                    {usageStats.hourly_distribution.map((bucket) => (
+                      <div className="stats-bar-col" key={bucket.hour} title={`${bucket.hour} 点: ${bucket.sessions} 次`}>
+                        <div className="stats-bar-stack">
+                          <div className="stats-bar hourly" style={{ height: `${barHeight(bucket.sessions, maxHourlySessions(usageStats.hourly_distribution))}%` }} />
+                        </div>
+                        <span className="stats-bar-label">{bucket.hour}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="stats-chart-legend">柱高 = 该时段累计次数</p>
+                </article>
+              </div>
+
+              <div className="stats-recent">
+                <h3>最近记录</h3>
+                <div className="stats-event-list">
+                  {usageStats.recent_events.map((event) => (
+                    <article className="stats-event-item" key={event.id}>
+                      <div className="stats-event-meta">
+                        <span>{formatHistoryTime(event.created_at)}</span>
+                        <span>{event.char_count} 字 · 节省 {formatDurationSeconds(event.saved_seconds)}</span>
+                      </div>
+                      <div className="stats-event-tags">
+                        <span>
+                          {event.service_profile === "fast"
+                            ? "快速"
+                            : event.service_profile === "custom"
+                              ? "自定义"
+                              : "稳定"}
+                        </span>
+                        {event.polish_enabled ? <span>润色</span> : null}
+                        {event.translation_enabled ? <span>翻译</span> : null}
+                        <span>录音 {formatDurationSeconds(event.recording_seconds)}</span>
+                        <span>流程 {formatDurationSeconds(event.total_seconds)}</span>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="stats-empty">
+              <BarChart3 size={30} />
+              <strong>暂无统计数据</strong>
+              <span>完成几次语音输入后，这里会显示次数、字数、时段分布和保守估算的节省时间。</span>
+            </div>
+          )}
+        </section>
+      ) : null}
+
       {activeSection === "model" ? (
         <SettingsPanel title="模型设置" subtitle="默认使用 FunASR 服务；本地 Whisper 仅在自行部署后配置">
           <SettingRow title="识别引擎" desc="FunASR 走 HTTP 服务；Whisper 需要自行安装 whisper.cpp 和 ggml 模型">
@@ -1315,7 +1512,7 @@ function MainApp() {
                   </button>
                 </div>
               </SettingRow>
-              <SettingRow title="服务线路" desc="稳定为默认远端主服务器；快速为笔记本本地服务器，延迟更低">
+              <SettingRow title="服务线路" desc="稳定/快速为预设线路；自定义可填写任意 FunASR 服务地址">
                 <select
                   value={normalizeServiceProfile(config.service_profile)}
                   onChange={(event) => selectServiceProfile(event.target.value as ServiceProfile)}
@@ -1327,6 +1524,28 @@ function MainApp() {
                   ))}
                 </select>
               </SettingRow>
+              {isCustomServiceProfile(config.service_profile) ? (
+                <>
+                  <SettingRow title="FunASR 服务地址" desc="语音识别 HTTP 服务，例如 http://host:10095">
+                    <input
+                      value={config.funasr_endpoint}
+                      onChange={(event) => updateConfig({ funasr_endpoint: event.target.value.trim() })}
+                      placeholder="http://127.0.0.1:10095"
+                    />
+                  </SettingRow>
+                  <SettingRow title="DeepSeek 代理地址" desc="AI 润色/翻译走同一代理时可与 FunASR 相同">
+                    <input
+                      value={config.deepseek_endpoint}
+                      onChange={(event) => updateConfig({ deepseek_endpoint: event.target.value.trim() })}
+                      placeholder="http://127.0.0.1:10095"
+                    />
+                  </SettingRow>
+                </>
+              ) : (
+                <SettingRow title="当前服务地址" desc="预设线路地址由线路自动切换；需自定义请选「自定义」">
+                  <input value={config.funasr_endpoint} readOnly />
+                </SettingRow>
+              )}
               <SettingRow title="FunASR 模型" desc="默认 Paraformer-large；可换成已支持的 ModelScope 模型名或本地路径">
                 <input value={config.funasr_model} onChange={(event) => updateConfig({ funasr_model: event.target.value })} />
               </SettingRow>
@@ -1458,7 +1677,7 @@ function MainApp() {
           <SettingRow title="DeepSeek 模型" desc="用于 AI 润色、补标点和翻译">
             <input value={config.deepseek_model} onChange={(event) => updateConfig({ deepseek_model: event.target.value })} />
           </SettingRow>
-          <SettingRow title="服务线路" desc="AI 润色与翻译走模型设置里选择的稳定/快速线路">
+          <SettingRow title="服务线路" desc="与模型设置联动；自定义时可分别配置 FunASR 与 DeepSeek 代理">
             <select
               value={normalizeServiceProfile(config.service_profile)}
               onChange={(event) => selectServiceProfile(event.target.value as ServiceProfile)}
@@ -1470,6 +1689,24 @@ function MainApp() {
               ))}
             </select>
           </SettingRow>
+          {isCustomServiceProfile(config.service_profile) ? (
+            <>
+              <SettingRow title="FunASR 服务地址" desc="语音识别 HTTP 服务">
+                <input
+                  value={config.funasr_endpoint}
+                  onChange={(event) => updateConfig({ funasr_endpoint: event.target.value.trim() })}
+                  placeholder="http://127.0.0.1:10095"
+                />
+              </SettingRow>
+              <SettingRow title="DeepSeek 代理地址" desc="AI 润色与翻译请求地址">
+                <input
+                  value={config.deepseek_endpoint}
+                  onChange={(event) => updateConfig({ deepseek_endpoint: event.target.value.trim() })}
+                  placeholder="http://127.0.0.1:10095"
+                />
+              </SettingRow>
+            </>
+          ) : null}
           <SettingRow title="AI 润色" desc="关闭后直接将识别原文输出到光标，零 LLM 延迟；翻译仍可独立开启">
             <label className="switch-row">
               <input
@@ -1756,6 +1993,58 @@ function formatHistoryTime(timestamp: number) {
     hour: "2-digit",
     minute: "2-digit"
   });
+}
+
+function formatDurationSeconds(seconds: number) {
+  const total = Math.max(0, Math.round(seconds));
+  if (total < 60) {
+    return `${total} 秒`;
+  }
+  const minutes = Math.floor(total / 60);
+  const remain = total % 60;
+  if (minutes < 60) {
+    return remain ? `${minutes} 分 ${remain} 秒` : `${minutes} 分`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainMinutes = minutes % 60;
+  return remainMinutes ? `${hours} 小时 ${remainMinutes} 分` : `${hours} 小时`;
+}
+
+function formatNumber(value: number) {
+  return value.toLocaleString("zh-CN");
+}
+
+function formatShortDate(date: string) {
+  const parts = date.split("-");
+  if (parts.length === 3) {
+    return `${parts[1]}/${parts[2]}`;
+  }
+  return date;
+}
+
+function barHeight(value: number, max: number) {
+  if (!max) {
+    return 0;
+  }
+  return Math.max(6, Math.round((value / max) * 100));
+}
+
+function maxDailySessions(buckets: UsageStatsSummary["daily_last_14_days"]) {
+  return buckets.reduce((max, bucket) => Math.max(max, bucket.sessions), 0);
+}
+
+function maxHourlySessions(buckets: UsageStatsSummary["hourly_distribution"]) {
+  return buckets.reduce((max, bucket) => Math.max(max, bucket.sessions), 0);
+}
+
+function StatsCard({ title, value, hint, accent }: { title: string; value: string; hint: string; accent?: boolean }) {
+  return (
+    <article className={accent ? "stats-card accent" : "stats-card"}>
+      <span>{title}</span>
+      <strong>{value}</strong>
+      <small>{hint}</small>
+    </article>
+  );
 }
 
 function overlayStageIcon(stage: Stage) {
